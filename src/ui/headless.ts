@@ -21,7 +21,7 @@ export async function runHeadless(agent: Agent, prompt: string, warnings: string
     },
     onInfo: (m) => err(pad + c.yellow(m)),
     confirm: async (tool, _args, reason) => {
-      const hint = reason ? "only --yolo allows it" : "use --mode acceptEdits, --auto or --yolo";
+      const hint = reason ? "only --yolo allows it" : tool.kind === "edit" ? "use --accept-edits, --auto or --yolo" : "commands need --auto or --yolo";
       err(pad + c.yellow(`  denied ${tool.name}${reason ? ` (${reason})` : ""}: nobody to ask in -p mode; ${hint}`));
       return "no";
     },
