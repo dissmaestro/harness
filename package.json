@@ -1,0 +1,17 @@
+{
+  "name": "agent",
+  "version": "0.1.0",
+  "description": "CLI coding agent for local models with lazy skills and deferred tools",
+  "type": "module",
+  "bin": { "agent": "src/cli.ts" },
+  "engines": { "node": ">=23.6" },
+  "scripts": {
+    "start": "node src/cli.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
