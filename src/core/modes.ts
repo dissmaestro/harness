@@ -36,28 +36,155 @@ export function nextMode(m: Mode): Mode {
   return MODE_CYCLE[(i + 1) % MODE_CYCLE.length];
 }
 
+// No wrappers that run another command (env, xargs, nohup, timeout, nice…): they would bypass the list.
 const READONLY_COMMANDS = new Set([
-  "ls", "cat", "head", "tail", "wc", "rg", "grep", "egrep", "find", "fd", "tree", "pwd", "echo", "printf",
-  "file", "stat", "du", "df", "which", "whereis", "type", "env", "printenv", "uname", "date", "whoami", "id",
+  "ls", "cat", "head", "tail", "wc", "rg", "grep", "egrep", "fgrep", "find", "fd", "tree", "pwd", "echo", "printf",
+  "file", "stat", "du", "df", "which", "whereis", "type", "printenv", "uname", "date", "whoami", "id",
   "sort", "uniq", "cut", "tr", "diff", "cmp", "md5sum", "sha256sum", "basename", "dirname", "realpath",
   "readlink", "less", "jq", "true", "test", "[",
 ]);
 const READONLY_GIT = new Set(["status", "log", "diff", "show", "branch", "blame", "ls-files", "rev-parse", "remote", "describe", "shortlog", "tag", "grep"]);
 
-/** True when every part of a shell command only reads (used in plan mode and read-only subagents). */
-export function isReadOnlyCommand(command: string): boolean {
-  command = command.replace(/\d?>\s*\/dev\/null/g, "");
-  if (/(^|[^>&])>(?!&)|>>|\btee\b|`|\$\(/.test(command)) return false; // redirection to files, substitutions
-  if (/\bsed\b[^|;&]*\s-i|\bfind\b[^|;&]*\s-(delete|exec)/.test(command)) return false;
-  for (const part of command.split(/&&|\|\||;|\||\n/)) {
-    const words = part.trim().split(/\s+/).filter((w) => !/^\w+=/.test(w)); // skip VAR=value prefixes
-    if (!words.length) continue;
-    const [cmd, sub] = words;
-    if (cmd === "git") {
-      if (!READONLY_GIT.has(sub ?? "")) return false;
+/** Flags that make an otherwise read-only command write files or run other programs. */
+const FORBIDDEN_FLAGS: Record<string, RegExp> = {
+  find: /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
+  fd: /^(-x|-X|--exec|--exec-batch)(=|$)/,
+  rg: /^--pre(=|$)/,
+  sort: /^(-[^-]*o|--output|--compress-program)/,
+  tree: /^(-o|--output)/,
+  date: /^(-s|--set)/,
+  file: /^-[^-]*C/,
+};
+
+/** Variables a read-only command may be prefixed with; others (GIT_*, PAGER, LD_PRELOAD…) can run code. */
+const SAFE_ENV = /^(LC_\w+|LANG|LANGUAGE|TZ|NO_COLOR|COLUMNS|TERM)=/;
+
+/**
+ * Splits a command line into simple commands (on ; & | && || and newlines) made of words, honouring
+ * quotes. Returns null for anything that can run or write something unseen: command and process
+ * substitution, heredocs, output redirection to anything but /dev/null.
+ */
+function splitCommands(command: string): string[][] | null {
+  const cmds: string[][] = [[]];
+  let word = "";
+  let inWord = false;
+  let quote = "";
+  let redirect: "" | "in" | "out" = "";
+  const endWord = (): boolean => {
+    if (!inWord) return true;
+    const w = word;
+    word = "";
+    inWord = false;
+    if (redirect) {
+      const r = redirect;
+      redirect = "";
+      return r === "in" || w === "/dev/null";
+    }
+    cmds[cmds.length - 1].push(w);
+    return true;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    const next = command[i + 1];
+    if (quote === "'") {
+      if (c === "'") quote = "";
+      else word += c;
       continue;
     }
+    if (quote === '"') {
+      if (c === '"') quote = "";
+      else if (c === "`" || (c === "$" && next === "(")) return null;
+      else if (c === "\\" && next !== undefined) word += command[++i];
+      else word += c;
+      continue;
+    }
+    if (c === "`" || (c === "$" && next === "(")) return null;
+    if (c === "\\") {
+      if (next !== undefined && next !== "\n") word += next;
+      i++;
+      inWord = true;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      inWord = true;
+    } else if (c === " " || c === "\t") {
+      if (!endWord()) return null;
+    } else if (c === "<" || c === ">" || (c === "&" && next === ">")) {
+      if (next === "(") return null; // process substitution <(…) >(…)
+      if (inWord && /^\d+$/.test(word)) {
+        word = ""; // file descriptor: 2>…
+        inWord = false;
+      } else if (!endWord()) return null;
+      if (redirect) return null;
+      let op = c;
+      while (op.length < 3 && /[<>&|]/.test(command[i + 1] ?? "")) op += command[++i];
+      if (/^[<>]&$/.test(op)) {
+        while (/[\d-]/.test(command[i + 1] ?? "")) i++; // fd duplication: 2>&1, >&2, 1>&-
+        continue;
+      }
+      if (op.startsWith("<<") && op !== "<<<") return null; // heredoc bodies aren't parsed
+      redirect = op.includes(">") ? "out" : "in";
+    } else if (c === "\n" || c === ";" || c === "&" || c === "|") {
+      if (!endWord() || redirect) return null;
+      if (cmds[cmds.length - 1].length) cmds.push([]);
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  if (quote || !endWord() || redirect) return null;
+  return cmds.filter((w) => w.length);
+}
+
+/** git branch/tag only list when given no names, or names together with a listing flag. */
+function gitListsOnly(sub: string, args: string[]): boolean {
+  const mutating =
+    sub === "branch"
+      ? /^(-[a-zA-Z]*[dDmMcCfut]|--(delete|move|copy|force|set-upstream-to|unset-upstream|edit-description|track|no-track|create-reflog)(=|$))/
+      : /^(-[a-zA-Z]*[dasufmFe]|--(delete|annotate|sign|local-user|force|message|file|edit|create-reflog)(=|$))/;
+  if (args.some((a) => mutating.test(a))) return false;
+  const listing = args.some((a) => /^(-l|--list|--contains|--no-contains|--merged|--no-merged|--points-at)(=|$)/.test(a));
+  return listing || args.every((a) => a.startsWith("-"));
+}
+
+function isReadOnlyGit(words: string[]): boolean {
+  let i = 1;
+  while (i < words.length) {
+    if (words[i] === "--no-pager") i++;
+    else if (words[i] === "-C") i += 2;
+    else break;
+  }
+  const sub = words[i] ?? "";
+  const args = words.slice(i + 1);
+  if (!READONLY_GIT.has(sub)) return false;
+  if (args.some((a) => /^--(output|ext-diff|open-files-in-pager)(=|$)|^-O/.test(a))) return false;
+  if (sub === "branch" || sub === "tag") return gitListsOnly(sub, args);
+  if (sub === "remote") {
+    const action = args.find((a) => !a.startsWith("-"));
+    return action === undefined || action === "show" || action === "get-url";
+  }
+  return true;
+}
+
+/** True when every part of a shell command only reads (used in plan mode and read-only subagents). */
+export function isReadOnlyCommand(command: string): boolean {
+  const cmds = splitCommands(command);
+  if (!cmds) return false;
+  for (let words of cmds) {
+    while (words.length && /^\w+=/.test(words[0])) {
+      if (!SAFE_ENV.test(words[0])) return false;
+      words = words.slice(1);
+    }
+    if (!words.length) continue;
+    const [cmd, ...args] = words;
+    if (cmd === "git") {
+      if (!isReadOnlyGit(words)) return false;
+      continue;
+    }
+    if (cmd === "env" && !args.length) continue; // bare env lists variables; with arguments it runs a command
     if (!READONLY_COMMANDS.has(cmd)) return false;
+    const forbidden = FORBIDDEN_FLAGS[cmd];
+    if (forbidden && args.some((a) => forbidden.test(a))) return false;
+    if (cmd === "uniq" && args.filter((a) => !a.startsWith("-")).length > 1) return false; // uniq IN OUT writes OUT
   }
   return true;
 }
@@ -89,6 +216,16 @@ function insideProject(cwd: string, path: unknown): boolean {
   return !rel.startsWith("..") && !isAbsolute(rel);
 }
 
+/** Directories whose files configure git, the agent, editors or hooks: they can run code later. */
+const PROTECTED_DIRS = new Set([".git", ".agent", ".claude", ".vscode", ".husky"]);
+
+/** True for paths inside the project that change agent/git/hook configuration (.git/, .agent/, .envrc…). */
+export function isProtectedPath(cwd: string, path: unknown): boolean {
+  if (typeof path !== "string") return false;
+  const parts = relative(cwd, isAbsolute(path) ? path : resolve(cwd, path)).split(/[\\/]/);
+  return parts.some((p, i) => PROTECTED_DIRS.has(p) && i < parts.length - 1) || parts[parts.length - 1] === ".envrc";
+}
+
 export type Decision = { action: "allow" } | { action: "ask"; reason?: string } | { action: "deny"; reason: string };
 
 /** Pure permission policy. The agent adds per-session "always allow" answers on top. */
@@ -107,8 +244,10 @@ export function decide(mode: Mode, tool: Tool, args: Record<string, unknown>, cw
   const command = tool.name === "Bash" ? String(args.command ?? "") : "";
   if (tool.kind === "edit") {
     const inside = insideProject(cwd, args.file_path);
-    if ((mode === "acceptEdits" || mode === "auto") && inside) return { action: "allow" };
-    return { action: "ask", reason: inside ? undefined : "edit outside the project" };
+    if (!inside) return { action: "ask", reason: "edit outside the project" };
+    if (isProtectedPath(cwd, args.file_path)) return { action: "ask", reason: "edits agent/git configuration" };
+    if (mode === "acceptEdits" || mode === "auto") return { action: "allow" };
+    return { action: "ask" };
   }
   if (mode === "auto") {
     if (command && isDangerousCommand(command)) return { action: "ask", reason: "potentially dangerous command" };

@@ -2,7 +2,16 @@ import { isAbsolute, relative } from "node:path";
 import type { Mode } from "../core/modes.ts";
 import { oneLine } from "../util.ts";
 
-const color = !process.env.NO_COLOR;
+/**
+ * Colors: off with NO_COLOR, or when stdout is not a terminal (FORCE_COLOR=1/0 overrides).
+ * The test runner (NODE_TEST_CONTEXT) keeps them on so rendering can be asserted.
+ */
+const force = process.env.FORCE_COLOR;
+let color = !process.env.NO_COLOR && (force !== undefined ? force !== "0" : !!process.stdout.isTTY || !!process.env.NODE_TEST_CONTEXT);
+export const colorEnabled = () => color;
+export const setColor = (on: boolean) => {
+  color = on;
+};
 const wrap = (open: number, close: number) => (s: string) => (color ? `\x1b[${open}m${s}\x1b[${close}m` : s);
 
 export const c = {

@@ -1,12 +1,16 @@
+import { statSync } from "node:fs";
 import { runHooks, type HookResult } from "../hooks/hooks.ts";
-import { chat, fetchContextWindow, isContextOverflow, type ChatResult, type Timings, type Usage } from "../providers/openai.ts";
-import { extractTextToolCalls, parseJsonLenient, stripThinking } from "../providers/toolcall-parse.ts";
+import { ChatError, chat, fetchContextWindow, isContextOverflow, type ChatResult, type Timings, type Usage } from "../providers/openai.ts";
+import { extractTextToolCalls, looksTruncated, parseJsonLenient, stripThinking } from "../providers/toolcall-parse.ts";
 import type { AgentDef, Registry } from "../registry/registry.ts";
 import { EXIT_PLAN_MODE } from "../tools/session-tools.ts";
 import { USE_TOOL } from "../tools/UseTool.ts";
 import type { Message, Session, Tool, ToolCall, ToolContext } from "../types.ts";
+import { oneLine, resolvePath } from "../util.ts";
+import { ChangeTracker } from "./changes.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, type Mode } from "./modes.ts";
+import { SessionJournal, readSession, sanitizeHistory } from "./sessions.ts";
 import type { Settings } from "./settings.ts";
 import { coerceArgs, validateArgs } from "./validate.ts";
 
@@ -19,13 +23,20 @@ export interface PlanDecision {
   feedback?: string;
 }
 
+/** What one Edit/Write actually did to a file (for showing a real diff). */
+export interface FileWrite {
+  path: string;
+  before: string | null;
+  after: string | null;
+}
+
 export interface AgentUI {
   onText(text: string): void;
   onReasoning?(text: string): void;
   /** true while waiting for the model (before its first output) */
   onWaiting?(waiting: boolean): void;
   onToolStart(name: string, args: Record<string, unknown>): void;
-  onToolEnd(name: string, result: string, isError: boolean): void;
+  onToolEnd(name: string, result: string, isError: boolean, change?: FileWrite): void;
   onInfo(message: string): void;
   confirm(tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval>;
   /** interactive plan approval; without it plans are returned to the caller as text */
@@ -43,14 +54,30 @@ export interface AgentOptions {
   mode?: Mode;
   /** set for subagents */
   subagent?: AgentDef;
+  /** write the conversation to ~/.agent/sessions so it survives a crash (the CLI turns this on) */
+  persist?: boolean;
+  /** shared with subagents so /diff and /undo see every change */
+  changes?: ChangeTracker;
 }
 
 const MAX_STOP_HOOK_RETRIES = 3;
 const DEFAULT_CONTEXT = 32_768;
+/** a text answer cut off by the token limit is continued automatically this many times */
+const MAX_CONTINUATIONS = 2;
+/** the same call with the same arguments: warn at this count, end the turn at the second */
+const REPEAT_WARN = 3;
+const REPEAT_STOP = 5;
 /** tools every subagent may use regardless of its tools list */
 const SUBAGENT_IMPLICIT = new Set(["ToolSearch", "UseTool", "Skill", "TodoWrite"]);
 /** tools no subagent may use */
 const SUBAGENT_FORBIDDEN = new Set(["Agent", EXIT_PLAN_MODE]);
+
+const TRUNCATED_CALL =
+  "Error: your output hit the token limit while writing this tool call, so its arguments are incomplete and it was NOT executed. " +
+  "Send it again in smaller pieces: for a big file, Write a short skeleton first and then add the rest with several Edit calls.";
+const EMPTY_REPLY = "Your last reply was empty. Continue the task, or if it is finished, give your final answer to the user.";
+const FINAL_STEP = (why: string) =>
+  `${why} Do not call any more tools. Write your final answer now: what you did, what you found, and what is left to do.`;
 
 export class Agent {
   cwd: string;
@@ -63,9 +90,13 @@ export class Agent {
   subagent?: AgentDef;
   lastUsage: Usage | undefined;
   lastTimings: Timings | undefined;
+  /** files changed by this agent and its subagents (for /files, /diff, /undo) */
+  changes: ChangeTracker;
+  journal: SessionJournal | undefined;
   /** called whenever the mode changes (UI redraws its prompt) */
   onModeChange?: (mode: Mode) => void;
   sessionAllowed = new Set<string>();
+  private persist: boolean;
   private systemPrompt: string;
   private lastCatalog = "";
   private pendingReminders: string[] = [];
@@ -81,6 +112,8 @@ export class Agent {
     this.subagent = opts.subagent;
     this.maxSteps = opts.maxSteps ?? (opts.subagent ? 30 : 60);
     this.mode = opts.mode ?? opts.settings.permissionMode;
+    this.persist = !!opts.persist && !opts.subagent;
+    this.changes = opts.changes ?? new ChangeTracker();
     this.systemPrompt = buildSystemPrompt(opts.cwd, opts.settings, opts.home, opts.subagent);
     this.reset();
   }
@@ -92,6 +125,45 @@ export class Agent {
     this.lastUsage = undefined;
     this.usageAtMessages = 0;
     this.pendingReminders = this.mode === "plan" && !this.subagent ? [PLAN_MODE_ON] : [];
+    // a new conversation gets a new journal file (written lazily, on the first message)
+    this.journal = this.persist ? new SessionJournal(this.cwd, this.settings.model, this.home) : undefined;
+  }
+
+  /** Every message goes through here so the journal always matches the history. */
+  private push(m: Message) {
+    this.messages.push(m);
+    this.journal?.append(m);
+  }
+
+  private replaceHistory(messages: Message[]) {
+    this.messages = messages;
+    this.journal?.reset(messages);
+  }
+
+  /**
+   * Continues a saved session: the history is repaired (dangling tool calls get results), the system prompt is
+   * rebuilt for today, and new messages are appended to the same journal.
+   */
+  loadSession(file: string, id: string) {
+    const saved = sanitizeHistory(readSession(file).filter((m) => m.role !== "system"));
+    this.journal = this.persist ? new SessionJournal(this.cwd, this.settings.model, this.home, id) : undefined;
+    this.messages = [{ role: "system", content: this.systemPrompt }, ...saved];
+    this.lastCatalog = "";
+    this.readFiles.clear();
+    this.lastUsage = undefined;
+    this.usageAtMessages = 0;
+    this.pendingReminders.push("This conversation was restored from a saved session. Files may have changed since: re-read them before editing.");
+  }
+
+  /** Queues a note for the model; it is sent with the next user message or tool result. */
+  notify(text: string) {
+    this.pendingReminders.push(text);
+  }
+
+  /** The user changed files behind the model's back (e.g. /undo): forget their read state and tell the model. */
+  notifyFilesChanged(paths: string[], message: string) {
+    for (const p of paths) this.readFiles.delete(p);
+    this.notify(message);
   }
 
   /** Always the same list, in the same order: changing it would invalidate the server's prompt cache. */
@@ -129,11 +201,12 @@ export class Agent {
   // ---------- main entry ----------
 
   async send(userText: string, ui: AgentUI, signal: AbortSignal): Promise<string> {
-    const hook = await this.hook(ui, "UserPromptSubmit", { prompt: userText });
+    const hook = await this.hook(ui, "UserPromptSubmit", { prompt: userText }, undefined, signal);
     if (hook.blocked) {
       ui.onInfo(`Prompt blocked by hook: ${hook.feedback}`);
       return "";
     }
+    if (!this.subagent) this.changes.beginTurn(userText);
     const extras: string[] = [];
     if (hook.context) extras.push(hook.context);
     // The catalog is appended (never put in the system prompt) and only re-sent when it changes.
@@ -143,7 +216,13 @@ export class Agent {
       this.lastCatalog = catalog;
     }
     extras.push(...this.pendingReminders.splice(0));
-    this.messages.push({ role: "user", content: [userText, ...extras.map(reminder)].join("\n\n") });
+    const content = [userText, ...extras.map(reminder)].join("\n\n");
+    // After a failed or interrupted turn the history may end with a user message or a dangling tool call:
+    // repair it so strict chat templates (alternating roles) keep working.
+    const last = this.messages[this.messages.length - 1];
+    if (last.role === "user" || (last.role === "assistant" && last.tool_calls?.length)) {
+      this.replaceHistory(sanitizeHistory([...this.messages, { role: "user", content }]));
+    } else this.push({ role: "user", content });
     return this.runLoop(ui, signal);
   }
 
@@ -156,16 +235,12 @@ export class Agent {
     return `Extra tools you can call with UseTool:\n${functionsBlock(this.registry, allowed)}`;
   }
 
-  private async runLoop(ui: AgentUI, signal: AbortSignal): Promise<string> {
-    let stopRetries = 0;
-    let overflowRetried = false;
-    for (let step = 0; step < this.maxSteps; step++) {
-      if (await this.shouldCompact()) await this.compact(ui, signal, { midTurn: true });
-
-      let res: ChatResult;
+  /** One model request with self-healing: retries (in chat), and one compaction when the context overflows. */
+  private async request(ui: AgentUI, signal: AbortSignal): Promise<ChatResult> {
+    for (let compacted = false; ; ) {
       ui.onWaiting?.(true);
       try {
-        res = await chat(this.settings, {
+        return await chat(this.settings, {
           messages: this.messages,
           tools: this.modelTools,
           signal,
@@ -174,24 +249,52 @@ export class Agent {
             ui.onText(t);
           },
           onReasoning: ui.onReasoning ? (t) => ui.onReasoning!(t) : undefined,
+          onRetry: (m) => {
+            ui.onWaiting?.(false);
+            ui.onInfo(m);
+          },
         });
       } catch (e) {
         ui.onWaiting?.(false);
-        if (!signal.aborted && isContextOverflow(e) && !overflowRetried) {
-          overflowRetried = true;
+        if (!signal.aborted && isContextOverflow(e) && !compacted) {
+          compacted = true;
           ui.onInfo("Context is full: compacting the conversation and retrying…");
           await this.compact(ui, signal, { midTurn: true });
-          step--;
           continue;
         }
+        // Keep what the model already said, so after an interrupt it knows where it stopped.
+        const partial = stripThinking((e as ChatError)?.partial ?? "");
+        if (partial) this.push({ role: "assistant", content: `${partial}\n\n[interrupted${signal.aborted ? " by the user" : ""}]` });
         throw e;
+      } finally {
+        ui.onWaiting?.(false);
       }
-      ui.onWaiting?.(false);
+    }
+  }
+
+  private async runLoop(ui: AgentUI, signal: AbortSignal): Promise<string> {
+    let stopRetries = 0;
+    let continuations = 0;
+    let emptyRetried = false;
+    let finalStep: string | undefined;
+    let answer = "";
+    const repeats = new Map<string, number>();
+
+    for (let step = 0; ; step++) {
+      if (step >= this.maxSteps - 1 && !finalStep) {
+        // Out of steps: one last request without tools so the caller still gets a report.
+        finalStep = `You have used all ${this.maxSteps} steps for this task.`;
+        this.push({ role: "user", content: reminder(FINAL_STEP(finalStep)) });
+      }
+      if (await this.shouldCompact()) await this.compact(ui, signal, { midTurn: true });
+
+      const res = await this.request(ui, signal);
       if (res.usage) {
         this.lastUsage = res.usage;
         this.usageAtMessages = this.messages.length;
       }
       this.lastTimings = res.timings ?? this.lastTimings;
+      const cutOff = res.finishReason === "length";
 
       let text = stripThinking(res.content);
       let calls = res.toolCalls;
@@ -208,27 +311,66 @@ export class Agent {
           );
         }
       }
-      this.messages.push({ role: "assistant", content: text || (calls.length ? null : ""), ...(calls.length && { tool_calls: calls }) });
+      if (finalStep) calls = []; // tools are no longer allowed: whatever it wrote is the answer
+      this.push({ role: "assistant", content: text || (calls.length ? null : ""), ...(calls.length && { tool_calls: calls }) });
 
       if (!calls.length) {
-        const stop = await this.hook(ui, "Stop", { last_message: text });
-        if (stop.blocked && stopRetries++ < MAX_STOP_HOOK_RETRIES) {
-          this.messages.push({ role: "user", content: reminder(`Stop hook feedback:\n${stop.feedback}`) });
+        answer += (answer && text ? "\n" : "") + text;
+        if (finalStep) {
+          ui.onInfo(finalStep.replace("You have", "The agent has"));
+          return answer;
+        }
+        if (cutOff && continuations++ < MAX_CONTINUATIONS) {
+          this.push({ role: "user", content: reminder("Your answer was cut off by the token limit. Continue exactly where you stopped, without repeating anything.") });
           continue;
         }
-        return text;
+        if (!text && !emptyRetried) {
+          emptyRetried = true;
+          this.push({ role: "user", content: reminder(EMPTY_REPLY) });
+          continue;
+        }
+        const stop = await this.hook(ui, "Stop", { last_message: text }, undefined, signal);
+        if (stop.blocked && stopRetries++ < MAX_STOP_HOOK_RETRIES) {
+          this.push({ role: "user", content: reminder(`Stop hook feedback:\n${stop.feedback}`) });
+          continue;
+        }
+        return answer;
       }
+      answer = "";
 
-      for (const call of calls) {
-        let result = signal.aborted ? "Tool call cancelled: the user interrupted." : await this.execCall(call, ui, signal);
+      let stopReason: string | undefined;
+      for (const [i, call] of calls.entries()) {
+        let result: string;
+        if (signal.aborted) result = "Tool call cancelled: the user interrupted.";
+        else if (stopReason) result = "Not executed: the turn was stopped.";
+        else if (cutOff && (i === calls.length - 1 || looksTruncated(call.function.arguments))) {
+          // finish_reason "length": the last call was being written when the limit hit; lenient JSON repair
+          // would otherwise run it with half its content (e.g. a Write of a truncated file).
+          result = TRUNCATED_CALL;
+          ui.onToolStart(call.function.name, {});
+          ui.onToolEnd(call.function.name, result, true);
+        } else {
+          result = await this.execCall(call, ui, signal);
+          const key = `${call.function.name}\0${canonicalArgs(call.function.arguments)}`;
+          const n = (repeats.get(key) ?? 0) + 1;
+          repeats.set(key, n);
+          if (n >= REPEAT_STOP) {
+            stopReason = `The model repeated the same ${call.function.name} call ${n} times; stopping this turn.`;
+          } else if (n >= REPEAT_WARN) {
+            result += `\n\n${reminder(`You have made this exact ${call.function.name} call ${n} times in this task. Repeating it will not give a different result: change your approach, or stop and tell the user what is blocking you.`)}`;
+          }
+        }
         // Mode changes made while the model works are reported with the next tool result (append-only).
         if (this.pendingReminders.length) result += "\n\n" + this.pendingReminders.splice(0).map(reminder).join("\n");
-        this.messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        this.push({ role: "tool", tool_call_id: call.id, content: result });
       }
       if (signal.aborted) return "";
+      if (stopReason) {
+        ui.onInfo(stopReason);
+        finalStep = stopReason;
+        this.push({ role: "user", content: reminder(FINAL_STEP(stopReason)) });
+      }
     }
-    ui.onInfo(`Stopped after ${this.maxSteps} steps.`);
-    return "";
   }
 
   // ---------- tools ----------
@@ -278,11 +420,15 @@ export class Agent {
       ui.onToolEnd(name, permission, true);
       return permission;
     }
-    const pre = await this.hook(ui, "PreToolUse", { tool_name: name, tool_input: args }, name);
+    const pre = await this.hook(ui, "PreToolUse", { tool_name: name, tool_input: args }, name, signal);
     if (pre.blocked) {
       const msg = `Blocked by PreToolUse hook: ${pre.feedback}`;
       ui.onToolEnd(name, msg, true);
       return msg;
+    }
+    if (signal.aborted) {
+      ui.onToolEnd(name, "cancelled", true);
+      return "Tool call cancelled: the user interrupted.";
     }
 
     const ctx: ToolContext = {
@@ -292,17 +438,31 @@ export class Agent {
       readFiles: this.readFiles,
       session: this.subagent ? undefined : this.session(ui, signal),
     };
+    const file = tool.kind === "edit" && typeof args.file_path === "string" ? resolvePath(this.cwd, args.file_path) : undefined;
+    if (file) this.changes.beforeWrite(file, name);
     let out: string;
     let isError = false;
     try {
-      out = await tool.run(args, ctx);
+      out = await raceAbort(tool.run(args, ctx), signal);
     } catch (e) {
-      out = `Error: ${(e as Error).message}`;
+      out = signal.aborted ? "Tool call cancelled: the user interrupted." : `Error: ${(e as Error).message}`;
       isError = true;
     }
-    const post = await this.hook(ui, "PostToolUse", { tool_name: name, tool_input: args, tool_response: out }, name);
+    const change = file ? this.changes.afterWrite(file) : undefined;
+    const post = await this.hook(ui, "PostToolUse", { tool_name: name, tool_input: args, tool_response: out }, name, signal);
     if (post.blocked) out += `\n\n${reminder(`PostToolUse hook feedback:\n${post.feedback}`)}`;
-    ui.onToolEnd(name, out, isError);
+    // A formatter hook rewrites the file right after our write: accept that as the model's latest view
+    // (otherwise the next Edit fails with "changed since you last read it"), but tell it to re-read.
+    if (file && !isError && this.readFiles.has(file)) {
+      try {
+        const mtime = statSync(file).mtimeMs;
+        if (mtime !== this.readFiles.get(file)) {
+          this.readFiles.delete(file);
+          out += `\n\n${reminder("A hook modified this file after your change (e.g. a formatter). Read it again before the next edit.")}`;
+        }
+      } catch {}
+    }
+    ui.onToolEnd(name, out, isError, change && !isError ? { path: file!, ...change } : undefined);
     return out;
   }
 
@@ -347,12 +507,37 @@ export class Agent {
       home: this.home,
       subagent: def,
       mode: this.mode,
+      changes: this.changes,
     });
     child.sessionAllowed = this.sessionAllowed;
     const childUi = ui.child?.(`${def.name}${description ? `: ${description}` : ""}`) ?? ui;
-    const answer = await child.send(prompt, childUi, signal);
+    let answer: string;
+    try {
+      answer = await child.send(prompt, childUi, signal);
+    } catch (e) {
+      if (signal.aborted) throw e;
+      // The subagent died (server gone for longer than the retry window, a bug…): hand back what it had
+      // done so far instead of losing it, so the parent can continue or re-delegate the rest.
+      childUi.onInfo(`subagent failed: ${(e as Error).message}`);
+      return `The ${def.name} subagent failed before finishing: ${(e as Error).message}\n\n${child.progressReport()}\n\nYou can call the Agent tool again with a narrower prompt to finish the rest, or continue yourself.`;
+    }
     const used = child.contextUsed();
-    return `${answer.trim() || "(the subagent finished without a final report)"}\n\n[subagent ${def.name} used ~${used} tokens of its own context]`;
+    return `${answer.trim() || child.progressReport()}\n\n[subagent ${def.name} used ~${used} tokens of its own context]`;
+  }
+
+  /** What this agent said and did so far (used when a subagent can't give a proper final report). */
+  progressReport(): string {
+    const said: string[] = [];
+    const did: string[] = [];
+    for (const m of this.messages) {
+      if (m.role !== "assistant") continue;
+      if (m.content?.trim()) said.push(m.content.trim());
+      for (const c of m.tool_calls ?? []) did.push(`- ${c.function.name}(${oneLine(c.function.arguments, 120)})`);
+    }
+    const parts = ["(No final report. Partial progress follows.)"];
+    if (said.length) parts.push(`Notes it wrote:\n${said.slice(-3).join("\n\n").slice(-3000)}`);
+    if (did.length) parts.push(`Tool calls it made (${did.length}):\n${did.slice(-15).join("\n")}`);
+    return parts.join("\n\n");
   }
 
   private async approvePlan(plan: string, ui: AgentUI): Promise<string> {
@@ -379,26 +564,45 @@ export class Agent {
   /**
    * Replaces the history with a model-written summary. The summary request is the current conversation
    * plus one message, so the server reuses its cache and only the summary itself costs time.
+   * If even that does not fit, falls back to a summary built without the model.
    */
   async compact(ui: AgentUI, signal: AbortSignal, opts: { focus?: string; midTurn?: boolean } = {}): Promise<boolean> {
     if (this.messages.length < 3) return false;
     const before = this.contextUsed();
     ui.onInfo(`Compacting conversation (~${before} tokens)…`);
-    const ask = (msgs: Message[]) =>
-      chat(this.settings, { messages: [...msgs, { role: "user", content: reminder(COMPACT_REQUEST(opts.focus)) }], tools: this.modelTools, signal, maxTokens: 4096 });
-    let res: ChatResult;
+    const ask = (msgs: Message[], extra = "") =>
+      chat(this.settings, {
+        messages: [...msgs, { role: "user", content: reminder(COMPACT_REQUEST(opts.focus) + extra) }],
+        tools: this.modelTools,
+        signal,
+        maxTokens: 4096,
+        onRetry: (m) => ui.onInfo(m),
+      });
+    let summary = "";
     ui.onWaiting?.(true);
     try {
+      let res: ChatResult | undefined;
       try {
         res = await ask(this.messages);
       } catch (e) {
         if (!isContextOverflow(e)) throw e;
-        res = await ask(shrinkToolResults(this.messages)); // the history itself no longer fits
+        try {
+          res = await ask(shrinkToolResults(this.messages)); // the history itself no longer fits
+        } catch (e2) {
+          if (!isContextOverflow(e2)) throw e2;
+          ui.onInfo("The conversation is too long even to summarize: keeping only the latest messages.");
+        }
       }
+      // A weak model sometimes answers the summary request with a tool call instead of text: ask once more.
+      if (res && !stripThinking(res.content).trim() && res.toolCalls.length) {
+        res = await ask(shrinkToolResults(this.messages), "\n\nDo NOT call any tools. Reply with the summary text only.").catch(() => res);
+      }
+      summary = res ? stripThinking(res.content).trim() : "";
+      if (res?.finishReason === "length") summary += "\n[summary was cut off]";
     } finally {
       ui.onWaiting?.(false);
     }
-    const summary = stripThinking(res.content).trim() || fallbackSummary(this.messages);
+    if (!summary) summary = fallbackSummary(this.messages);
 
     const parts = [`This session was compacted to save context. Summary of the conversation so far:\n\n${summary}`];
     const catalog = this.catalogForThisAgent();
@@ -408,8 +612,9 @@ export class Agent {
     if (this.mode === "plan" && !this.subagent) parts.push(reminder(PLAN_MODE_ON));
     if (opts.midTurn) parts.push("Continue the current task from where you left off. Re-read files before editing them.");
 
-    this.messages = [{ role: "system", content: this.systemPrompt }, { role: "user", content: parts.join("\n\n") }];
-    if (!opts.midTurn) this.messages.push({ role: "assistant", content: "Understood. I have the summary and will continue from there." });
+    const next: Message[] = [{ role: "system", content: this.systemPrompt }, { role: "user", content: parts.join("\n\n") }];
+    if (!opts.midTurn) next.push({ role: "assistant", content: "Understood. I have the summary and will continue from there." });
+    this.replaceHistory(next);
     this.lastCatalog = catalog;
     this.readFiles.clear();
     this.lastUsage = undefined;
@@ -423,10 +628,31 @@ export class Agent {
     event: Parameters<typeof runHooks>[1],
     payload: Record<string, unknown>,
     toolName?: string,
+    signal?: AbortSignal,
   ): Promise<HookResult> {
-    const r = await runHooks(this.settings.hooks, event, payload, this.cwd, toolName);
+    const r = await runHooks(this.settings.hooks, event, payload, this.cwd, toolName, signal);
     for (const w of r.warnings) ui.onInfo(w);
     return r;
+  }
+}
+
+/** Resolves with the promise, or rejects as soon as the signal aborts (for tools that ignore the signal). */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+function canonicalArgs(raw: string): string {
+  try {
+    const sort = (v: unknown): unknown =>
+      Array.isArray(v) ? v.map(sort) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, sort(x)])) : v;
+    return JSON.stringify(sort(parseJsonLenient(raw)));
+  } catch {
+    return raw.trim();
   }
 }
 
@@ -439,12 +665,21 @@ function functionsBlock(registry: Registry, names: string[]): string {
 }
 
 function shrinkToolResults(messages: Message[]): Message[] {
-  return messages.map((m) =>
-    m.role === "tool" && m.content.length > 400 ? { ...m, content: m.content.slice(0, 400) + "\n[…truncated for compaction]" } : m,
+  const keepFrom = Math.max(0, messages.length - 6);
+  return messages.map((m, i) =>
+    m.role === "tool" && m.content.length > 400 && i < keepFrom ? { ...m, content: m.content.slice(0, 400) + "\n[…truncated for compaction]" } : m,
   );
 }
 
 function fallbackSummary(messages: Message[]): string {
-  const asks = messages.filter((m) => m.role === "user").map((m) => `- ${String(m.content).split("<system-reminder>")[0].trim().slice(0, 300)}`);
-  return `(The model did not produce a summary.) User requests so far:\n${asks.join("\n")}`;
+  const asks = messages.filter((m) => m.role === "user").map((m) => `- ${String(m.content).split("<system-reminder>")[0].trim().slice(0, 300)}`).filter((l) => l.length > 2);
+  const lastSaid = [...messages].reverse().find((m) => m.role === "assistant" && m.content?.trim());
+  const did = messages.flatMap((m) => (m.role === "assistant" ? (m.tool_calls ?? []) : [])).slice(-20).map((c) => `- ${c.function.name}(${oneLine(c.function.arguments, 100)})`);
+  return [
+    `(Summary built without the model.) User requests so far:\n${asks.slice(-10).join("\n")}`,
+    did.length ? `Most recent tool calls:\n${did.join("\n")}` : "",
+    lastSaid ? `Last thing you said:\n${String(lastSaid.content).slice(-1500)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }

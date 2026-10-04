@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { McpServerConfig } from "../../core/settings.ts";
 import type { JSONSchema, Tool } from "../../types.ts";
-import { truncateMiddle } from "../../util.ts";
+import { truncateMiddle, VERSION } from "../../util.ts";
 import type { Registry } from "../registry.ts";
 
 interface McpToolInfo {
@@ -39,8 +39,26 @@ export class McpClient {
   }
 
   start(): Promise<void> {
-    this.ready ??= this.init();
+    if (!this.ready) {
+      // a failed start is forgotten so the next call tries again
+      const ready: Promise<void> = this.init().catch((e) => {
+        if (this.ready === ready) this.reset(e);
+        throw e;
+      });
+      this.ready = ready;
+    }
     return this.ready;
+  }
+
+  /** Kills the server and fails pending requests; the next call restarts it. */
+  private reset(err: Error, signal: NodeJS.Signals = "SIGTERM") {
+    const proc = this.proc;
+    this.proc = undefined;
+    this.ready = undefined;
+    this.buf = "";
+    for (const p of this.pending.values()) p.reject(err);
+    this.pending.clear();
+    proc?.kill(signal);
   }
 
   private async init() {
@@ -50,23 +68,24 @@ export class McpClient {
     });
     this.proc = proc;
     proc.stdout!.setEncoding("utf8");
-    proc.stdout!.on("data", (d: string) => this.onData(d));
+    proc.stdout!.on("data", (d: string) => {
+      if (this.proc === proc) this.onData(d);
+    });
     proc.stderr!.on("data", (d) => {
       this.stderrTail = (this.stderrTail + d).slice(-2000);
     });
     proc.stdin!.on("error", () => {});
-    const fail = (e: Error) => {
-      for (const p of this.pending.values()) p.reject(e);
-      this.pending.clear();
-      this.proc = undefined;
-      this.ready = undefined; // next call restarts the server
-    };
-    proc.on("error", (e) => fail(new Error(`MCP server "${this.name}" failed to start: ${e.message}`)));
-    proc.on("exit", (code) => fail(new Error(`MCP server "${this.name}" exited (code ${code}). ${this.stderrTail.trim()}`)));
+    // events from a server that was already replaced must not touch the new one
+    proc.on("error", (e) => {
+      if (this.proc === proc) this.reset(new Error(`MCP server "${this.name}" failed to start: ${e.message}`));
+    });
+    proc.on("exit", (code) => {
+      if (this.proc === proc) this.reset(new Error(`MCP server "${this.name}" exited (code ${code}). ${this.stderrTail.trim()}`));
+    });
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "agent", version: "0.1.0" },
+      clientInfo: { name: "agent", version: VERSION },
     });
     this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
   }
@@ -102,20 +121,32 @@ export class McpClient {
     this.proc?.stdin?.write(JSON.stringify(msg) + "\n");
   }
 
-  private request(method: string, params: object, timeoutMs = 60_000): Promise<any> {
+  private request(method: string, params: object, timeoutMs = 60_000, signal?: AbortSignal): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(new Error(`MCP ${this.name}: ${method} aborted`));
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`MCP ${this.name}: ${method} timed out`));
+        // a server that doesn't answer is likely stuck: restart it on the next call
+        this.reset(new Error(`MCP ${this.name}: ${method} timed out after ${timeoutMs / 1000}s; the server was restarted`), "SIGKILL");
       }, timeoutMs);
+      const onAbort = () => {
+        if (!this.pending.delete(id)) return;
+        cleanup();
+        this.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id, reason: "aborted by the user" } });
+        reject(new Error(`MCP ${this.name}: ${method} aborted`));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          cleanup();
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          cleanup();
           reject(e);
         },
       });
@@ -135,9 +166,9 @@ export class McpClient {
     return tools;
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
     await this.start();
-    const r = await this.request("tools/call", { name, arguments: args }, 300_000);
+    const r = await this.request("tools/call", { name, arguments: args }, 300_000, signal);
     const text = (r.content ?? [])
       .map((c: any) => (c.type === "text" ? c.text : `[${c.type} content omitted]`))
       .join("\n");
@@ -158,9 +189,9 @@ function mcpTool(server: string, info: McpToolInfo, client: McpClient, onFirstSt
     kind: info.annotations?.readOnlyHint ? "read" : "exec",
     source: `mcp:${server}`,
     parameters: info.inputSchema ?? { type: "object", properties: {} },
-    async run(args) {
+    async run(args, ctx) {
       const first = !client.started;
-      const out = await client.callTool(info.name, args);
+      const out = await client.callTool(info.name, args, ctx.signal);
       if (first) onFirstStart();
       return truncateMiddle(out);
     },

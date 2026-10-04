@@ -9,6 +9,7 @@ import { Edit, Read, Write } from "../src/tools/core/files.ts";
 import { applyEdit } from "../src/tools/core/edit-match.ts";
 import { Bash, Glob, Grep } from "../src/tools/core/shell.ts";
 import type { ToolContext } from "../src/types.ts";
+import { killAllProcesses, runProcess } from "../src/util.ts";
 import { put, tempDir } from "./helpers.ts";
 
 const ctx = (cwd: string): ToolContext => ({
@@ -77,6 +78,58 @@ test("Bash, Grep, Glob", async () => {
   assert.match(await Grep.run({ pattern: "needle", output_mode: "content" }, c), /src\/a\.ts:1:const needle/);
   assert.equal(await Grep.run({ pattern: "absent" }, c), "No matches found.");
   assert.deepEqual((await Glob.run({ pattern: "*.ts" }, c)).split("\n").sort(), ["src/a.ts", "src/b.ts"]);
+});
+
+test("Read caps output by characters and says where to continue", async () => {
+  const cwd = tempDir();
+  put(cwd, "big.txt", Array.from({ length: 3000 }, (_, i) => `line ${i + 1} ` + "x".repeat(40)).join("\n"));
+  put(cwd, "wide.txt", "y".repeat(5000));
+  const c = ctx(cwd);
+  const out = await Read.run({ file_path: "big.txt" }, c);
+  assert.ok(out.length < 42_000, `${out.length}`);
+  const m = out.match(/\[truncated at line (\d+) of 3000 — use offset=(\d+) to continue\]$/);
+  assert.ok(m, out.slice(-200));
+  assert.equal(Number(m[2]), Number(m[1]) + 1);
+  const wide = await Read.run({ file_path: "wide.txt" }, c);
+  assert.ok(wide.length < 1100 && wide.endsWith("…"));
+});
+
+test("Grep and Glob: hidden files yes, .git no; content capped", async () => {
+  const cwd = tempDir();
+  put(cwd, ".github/ci.yml", "needle\n");
+  put(cwd, ".git/config", "needle\n");
+  put(cwd, "long.txt", Array.from({ length: 400 }, () => "needle " + "z".repeat(1000)).join("\n"));
+  const c = ctx(cwd);
+  assert.deepEqual((await Grep.run({ pattern: "needle" }, c)).split("\n").sort(), [".github/ci.yml", "long.txt"]);
+  assert.equal(await Glob.run({ pattern: "*.yml" }, c), ".github/ci.yml");
+  assert.equal(await Glob.run({ pattern: "config" }, c), "No files found.");
+  const content = await Grep.run({ pattern: "needle", output_mode: "content", path: "long.txt", head_limit: 1000 }, c);
+  assert.ok(content.length < 21_000, `${content.length}`);
+  assert.ok(content.split("\n").every((l) => l.length < 400));
+  assert.match(content, /more lines; narrow the search/);
+});
+
+test("Bash: long output is truncated and saved in full", async () => {
+  const c = ctx(tempDir());
+  const out = await Bash.run({ command: "seq 1 20000" }, c);
+  assert.ok(out.length < 17_000, `${out.length}`);
+  const saved = out.match(/full output \(\d+ chars\) saved to (\S+);/)?.[1];
+  assert.ok(saved, out.slice(-300));
+  assert.equal(readFileSync(saved, "utf8").split("\n").length, 20000);
+});
+
+test("runProcess: aborted signal, background children, killAllProcesses", async () => {
+  const cwd = tempDir();
+  const ac = new AbortController();
+  ac.abort();
+  const t0 = Date.now();
+  assert.equal((await runProcess("sleep", ["5"], { cwd, signal: ac.signal })).code, null);
+  // a daemonized grandchild keeps stdout open; we must not wait for it
+  const r = await runProcess("bash", ["-c", "echo started; sleep 30 & disown; exit 0"], { cwd });
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout.trim(), "started");
+  assert.ok(Date.now() - t0 < 5000, "did not hang on the background sleep");
+  killAllProcesses(); // the background sleep's group must die
 });
 
 test("lenient JSON", () => {

@@ -32,12 +32,95 @@ export interface ChatResult {
   finishReason?: string;
 }
 
+/** settings.retry: how hard to try before giving up on the model server */
+export interface RetryConfig {
+  /** keep retrying for this long (seconds); 0 disables retries */
+  maxSeconds: number;
+  /** abort if the first byte takes longer than this (prompt processing of a long context can be slow) */
+  firstByteSeconds: number;
+  /** abort if the stream stalls for this long between chunks */
+  idleSeconds: number;
+}
+
+export const DEFAULT_RETRY: RetryConfig = { maxSeconds: 300, firstByteSeconds: 900, idleSeconds: 180 };
+
+/** A request error, with whatever was streamed before it happened. */
+export class ChatError extends Error {
+  retryable: boolean;
+  status?: number;
+  retryAfterMs?: number;
+  partial: string;
+  constructor(message: string, opts: { retryable: boolean; status?: number; retryAfterMs?: number; partial?: string }) {
+    super(message);
+    this.retryable = opts.retryable;
+    this.status = opts.status;
+    this.retryAfterMs = opts.retryAfterMs;
+    this.partial = opts.partial ?? "";
+  }
+}
+
 export function toolSpec(t: Tool) {
   return { type: "function" as const, function: { name: t.name, description: t.description, parameters: t.parameters } };
 }
 
-/** Streaming chat completion against any OpenAI-compatible server. */
-export async function chat(settings: Settings, req: ChatRequest): Promise<ChatResult> {
+const RETRY_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const NETWORK_ERROR = /fetch failed|terminated|socket|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|UND_ERR|other side closed|premature close/i;
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const t = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    function onAbort() {
+      clearTimeout(t);
+      reject(signal!.reason);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+
+/** llama-server answers /health with 503 while it loads the model; wait until it is ready (or there is nothing to ask). */
+async function waitForHealth(settings: Settings, deadline: number, signal?: AbortSignal): Promise<void> {
+  const url = `${settings.baseUrl.replace(/\/v1\/?$/, "").replace(/\/$/, "")}/health`;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.any([AbortSignal.timeout(5000), ...(signal ? [signal] : [])]) });
+      if (res.ok || res.status === 404) return; // 404: the server has no /health (Ollama, vLLM…): just retry the request
+    } catch {
+      if (signal?.aborted) throw signal.reason;
+    }
+    await sleep(2000, signal);
+  }
+}
+
+/**
+ * Streaming chat completion that survives a flaky server: retries network errors, 429/5xx, stalled and
+ * cut-off streams with exponential backoff, and waits for llama-server to finish loading a model.
+ * `onRetry` reports each attempt; text streamed by a failed attempt is regenerated from scratch.
+ */
+export async function chat(settings: Settings, req: ChatRequest & { onRetry?: (message: string) => void }): Promise<ChatResult> {
+  const cfg = { ...DEFAULT_RETRY, ...(settings as Settings & { retry?: Partial<RetryConfig> }).retry };
+  const deadline = Date.now() + cfg.maxSeconds * 1000;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await chatOnce(settings, req, cfg);
+    } catch (e) {
+      if (req.signal?.aborted) throw e;
+      const err = e instanceof ChatError ? e : new ChatError((e as Error).message, { retryable: NETWORK_ERROR.test(String((e as Error).message) + String((e as any)?.cause?.code ?? "")) });
+      if (!err.retryable || Date.now() >= deadline) throw err;
+      const delay = Math.min(err.retryAfterMs ?? 1000 * 2 ** (attempt - 1), 30_000) * (0.8 + Math.random() * 0.4);
+      const why = err.status ? `HTTP ${err.status}` : err.message.replace(/^LLM request failed: /, "").slice(0, 80);
+      req.onRetry?.(`Model server problem (${why}); retry ${attempt} in ${Math.round(delay / 1000)}s…${err.partial ? " (the partial answer will be regenerated)" : ""}`);
+      await sleep(delay, req.signal);
+      if (!err.status) await waitForHealth(settings, deadline, req.signal);
+    }
+  }
+}
+
+/** One streaming request. Throws ChatError (retryable or not) with the partial content streamed so far. */
+async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig): Promise<ChatResult> {
   const body: Record<string, unknown> = {
     model: settings.model,
     messages: req.messages,
@@ -48,18 +131,56 @@ export async function chat(settings: Settings, req: ChatRequest): Promise<ChatRe
   if (settings.temperature !== undefined) body.temperature = settings.temperature;
   if (req.maxTokens ?? settings.maxTokens) body.max_tokens = req.maxTokens ?? settings.maxTokens;
 
-  const res = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    signal: req.signal,
-    headers: {
-      "content-type": "application/json",
-      ...(settings.apiKey ? { authorization: `Bearer ${settings.apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
+  // Our own watchdog: the first byte may take long (prompt processing), but a stream must not stall.
+  const watchdog = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stalled = "";
+  const arm = (seconds: number, what: string) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      stalled = what;
+      watchdog.abort(new Error(what));
+    }, seconds * 1000);
+  };
+  arm(cfg.firstByteSeconds, `no response from the model server for ${cfg.firstByteSeconds}s`);
+  const signal = req.signal ? AbortSignal.any([req.signal, watchdog.signal]) : watchdog.signal;
+  // Errors caused by our watchdog are retryable; errors caused by the user's abort are passed through.
+  const wrap = (e: unknown, partial: string): never => {
+    if (req.signal?.aborted) {
+      if (partial && e && typeof e === "object") (e as { partial?: string }).partial = partial;
+      throw e;
+    }
+    if (e instanceof ChatError) throw e;
+    if (stalled) throw new ChatError(stalled, { retryable: true, partial });
+    const msg = (e as Error)?.message ?? String(e);
+    const code = String((e as any)?.cause?.code ?? (e as any)?.cause?.message ?? "");
+    throw new ChatError(`LLM request failed: ${msg}${code ? ` (${code})` : ""}`, { retryable: NETWORK_ERROR.test(msg + " " + code), partial });
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      signal,
+      headers: {
+        "content-type": "application/json",
+        ...(settings.apiKey ? { authorization: `Bearer ${settings.apiKey}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    return wrap(e, "");
+  }
   if (!res.ok || !res.body) {
+    clearTimeout(timer);
     const text = await res.text().catch(() => "");
-    throw new Error(`LLM request failed: HTTP ${res.status} ${text.slice(0, 2000)}`);
+    const retryAfter = Number(res.headers.get("retry-after"));
+    throw new ChatError(`LLM request failed: HTTP ${res.status} ${text.slice(0, 2000)}`, {
+      retryable: RETRY_STATUS.has(res.status) && !isContextOverflow(text),
+      status: res.status,
+      retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined,
+    });
   }
 
   let content = "";
@@ -68,9 +189,11 @@ export async function chat(settings: Settings, req: ChatRequest): Promise<ChatRe
   let timings: Timings | undefined;
   let finishReason: string | undefined;
 
+  let done = false;
   const handle = (line: string) => {
     if (!line.startsWith("data:")) return;
     const data = line.slice(5).trim();
+    if (data === "[DONE]") done = true;
     if (!data || data === "[DONE]") return;
     let chunk: any;
     try {
@@ -78,7 +201,10 @@ export async function chat(settings: Settings, req: ChatRequest): Promise<ChatRe
     } catch {
       return;
     }
-    if (chunk.error) throw new Error(`LLM error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
+    if (chunk.error) {
+      const message = chunk.error.message ?? JSON.stringify(chunk.error);
+      throw new ChatError(`LLM error: ${message}`, { retryable: !isContextOverflow(message) && /unavailable|overload|busy|loading|timeout|internal/i.test(message), partial: content });
+    }
     if (chunk.usage) usage = chunk.usage;
     if (chunk.timings) timings = chunk.timings;
     const choice = chunk.choices?.[0];
@@ -102,15 +228,24 @@ export async function chat(settings: Settings, req: ChatRequest): Promise<ChatRe
 
   const decoder = new TextDecoder();
   let buf = "";
-  for await (const chunk of res.body) {
-    buf += decoder.decode(chunk, { stream: true });
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      handle(buf.slice(0, nl).trim());
-      buf = buf.slice(nl + 1);
+  try {
+    for await (const chunk of res.body) {
+      arm(cfg.idleSeconds, `the model server stopped streaming for ${cfg.idleSeconds}s`);
+      buf += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        handle(buf.slice(0, nl).trim());
+        buf = buf.slice(nl + 1);
+      }
     }
+    handle(buf.trim());
+  } catch (e) {
+    wrap(e, content);
+  } finally {
+    clearTimeout(timer);
   }
-  handle(buf.trim());
+  // The connection closed without [DONE] or a finish reason: the server died mid-answer.
+  if (!done && !finishReason) throw new ChatError("the model server closed the stream mid-answer", { retryable: true, partial: content });
 
   const toolCalls = calls
     .filter((c) => c && c.function.name)

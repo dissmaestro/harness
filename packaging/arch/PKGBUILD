@@ -1,0 +1,36 @@
+# Maintainer: max
+# Build from the local checkout (no network): ./build.sh   (extra args go to makepkg, e.g. --nocheck)
+
+pkgname=local-agent
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="CLI coding agent for local models (llama.cpp, Ollama, vLLM) with lazy skills and deferred tools"
+arch=(any)
+license=(MIT)
+depends=('nodejs>=23.6' ripgrep bash)
+optdepends=('git: diffs and commits'
+            'llama.cpp: local model server'
+            'ollama: local model server')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+check() {
+  cd "$pkgname-$pkgver"
+  node --test test/*.test.ts
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  # Node refuses to strip types under node_modules, so the sources live in /usr/lib/local-agent.
+  # skills/ and agents/ must sit next to src/ (BUILTIN_DIR in src/core/settings.ts).
+  install -d "$pkgdir/usr/lib/$pkgname"
+  cp -r --no-preserve=ownership package.json src skills agents "$pkgdir/usr/lib/$pkgname/"
+  find "$pkgdir/usr/lib/$pkgname" -type d -exec chmod 755 {} + -o -type f -exec chmod 644 {} +
+
+  install -d "$pkgdir/usr/bin"
+  printf '#!/bin/sh\nexec /usr/bin/node /usr/lib/%s/src/cli.ts "$@"\n' "$pkgname" > "$pkgdir/usr/bin/agent"
+  chmod 755 "$pkgdir/usr/bin/agent"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

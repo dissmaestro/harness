@@ -5,7 +5,9 @@ import { numberLines, resolvePath } from "../../util.ts";
 import { applyEdit } from "./edit-match.ts";
 
 const DEFAULT_LIMIT = 2000;
-const MAX_LINE = 2000;
+const MAX_LINE = 1000;
+/** ~11k tokens: a single Read must leave room in a 64k context */
+const MAX_CHARS = 40_000;
 
 function requireFreshRead(path: string, ctx: ToolContext) {
   const readAt = ctx.readFiles.get(path);
@@ -43,10 +45,19 @@ export const Read: Tool = {
     const lines = text.split("\n");
     const start = Math.max(1, args.offset ?? 1);
     const limit = args.limit ?? DEFAULT_LIMIT;
-    const slice = lines.slice(start - 1, start - 1 + limit).map((l) => (l.length > MAX_LINE ? l.slice(0, MAX_LINE) + "…" : l));
+    const slice: string[] = [];
+    let chars = 0;
+    for (let l of lines.slice(start - 1, start - 1 + limit)) {
+      if (l.length > MAX_LINE) l = l.slice(0, MAX_LINE) + "…";
+      chars += l.length + 8; // + line-number prefix
+      if (chars > MAX_CHARS && slice.length) break;
+      slice.push(l);
+    }
     let out = numberLines(slice, start);
     const end = start - 1 + slice.length;
-    if (end < lines.length) out += `\n[showing lines ${start}-${end} of ${lines.length}; use offset to read more]`;
+    if (slice.length < Math.min(limit, lines.length - start + 1)) {
+      out += `\n[truncated at line ${end} of ${lines.length} — use offset=${end + 1} to continue]`;
+    } else if (end < lines.length) out += `\n[showing lines ${start}-${end} of ${lines.length}; use offset to read more]`;
     return out;
   },
 };

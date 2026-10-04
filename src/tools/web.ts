@@ -5,6 +5,7 @@ import { USER_AGENT, webSearch } from "../web/search.ts";
 
 const MAX_DOWNLOAD = 3_000_000;
 const DEFAULT_CHARS = 12_000;
+const MAX_CHARS = 30_000;
 
 export const WebFetch: Tool = {
   name: "WebFetch",
@@ -18,7 +19,7 @@ export const WebFetch: Tool = {
     properties: {
       url: { type: "string", description: "http(s) URL" },
       start: { type: "integer", description: "Character offset to start from (default 0)" },
-      max_chars: { type: "integer", description: `Characters to return (default ${DEFAULT_CHARS})` },
+      max_chars: { type: "integer", description: `Characters to return (default ${DEFAULT_CHARS}, max ${MAX_CHARS})` },
     },
     required: ["url"],
   },
@@ -47,7 +48,7 @@ export const WebFetch: Tool = {
     const title = isHtml ? htmlTitle(body) : "";
 
     const start = Math.max(0, args.start ?? 0);
-    const max = args.max_chars ?? DEFAULT_CHARS;
+    const max = Math.min(args.max_chars ?? DEFAULT_CHARS, MAX_CHARS); // keep one page well inside a 64k context
     const part = text.slice(start, start + max);
     const end = start + part.length;
     const header = `URL: ${res.url}${title ? `\nTitle: ${title}` : ""}\nShowing characters ${start}-${end} of ${text.length}.`;

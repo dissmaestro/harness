@@ -23,7 +23,7 @@ export function parseJsonLenient(input: string): unknown {
   return JSON.parse(closeBrackets(s));
 }
 
-function closeBrackets(s: string): string {
+function scanBrackets(s: string): { stack: string[]; inString: boolean } {
   const stack: string[] = [];
   let inString = false;
   let escaped = false;
@@ -39,9 +39,26 @@ function closeBrackets(s: string): string {
     else if (ch === "[") stack.push("]");
     else if (ch === "}" || ch === "]") stack.pop();
   }
+  return { stack, inString };
+}
+
+function closeBrackets(s: string): string {
+  const { stack, inString } = scanBrackets(s);
   let out = inString ? s + '"' : s;
   out = out.replace(/,\s*$/, "");
   return out + stack.reverse().join("");
+}
+
+/** true when the JSON text ends inside a string or with unclosed brackets, i.e. it was cut off rather than just sloppy */
+export function looksTruncated(input: string): boolean {
+  const s = input.trim();
+  if (!s) return false;
+  try {
+    JSON.parse(s);
+    return false;
+  } catch {}
+  const { stack, inString } = scanBrackets(s.slice(Math.max(0, s.search(/[{[]/))));
+  return inString || stack.length > 0;
 }
 
 function normalizeArgs(raw: unknown): Record<string, unknown> {

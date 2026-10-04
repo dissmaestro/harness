@@ -1,3 +1,4 @@
+import { lineHighlighter } from "./highlight.ts";
 import { c } from "./render.ts";
 
 function inline(s: string): string {
@@ -12,6 +13,8 @@ function inline(s: string): string {
 export class MarkdownStream {
   private buf = "";
   private inCode = false;
+  /** highlighter for the current fenced block (its language from the fence) */
+  private hl: (line: string) => string = (x) => x;
   private write: (s: string) => void;
 
   constructor(write: (s: string) => void) {
@@ -38,15 +41,17 @@ export class MarkdownStream {
   reset() {
     this.buf = "";
     this.inCode = false;
+    this.hl = (x) => x;
   }
 
   renderLine(line: string): string {
     const fence = line.match(/^\s*```(\S*)/);
     if (fence) {
       this.inCode = !this.inCode;
+      this.hl = this.inCode ? lineHighlighter(fence[1]) : (x) => x;
       return c.gray(this.inCode ? `┌─ ${fence[1] || "code"}` : "└─");
     }
-    if (this.inCode) return c.gray("│ ") + line;
+    if (this.inCode) return c.gray("│ ") + this.hl(line);
     const h = line.match(/^(#{1,6})\s+(.*)/);
     if (h) return h[1].length <= 2 ? c.bold(c.magenta(inline(h[2]))) : c.bold(inline(h[2]));
     if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) return c.gray("─".repeat(40));

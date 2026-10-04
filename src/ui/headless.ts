@@ -1,4 +1,5 @@
 import type { Agent, AgentUI } from "../core/loop.ts";
+import { diffStat } from "./diff.ts";
 import { argSummary, c, resultSummary } from "./render.ts";
 
 /** agent -p "prompt": answer on stdout, tool activity on stderr. Actions that would need a question are denied. */
@@ -10,7 +11,14 @@ export async function runHeadless(agent: Agent, prompt: string, warnings: string
       if (!pad) process.stdout.write(t);
     },
     onToolStart: (name, args) => err(pad + c.dim(`● ${name}(${argSummary(name, args, agent.cwd)})`)),
-    onToolEnd: (_n, result, isError) => err(pad + c.dim("  ⎿ ") + (isError ? c.red(resultSummary(result)) : c.dim(resultSummary(result)))),
+    onToolEnd: (_n, result, isError, change?: { path: string; before: string | null; after: string | null }) => {
+      let summary = isError ? c.red(resultSummary(result)) : c.dim(resultSummary(result));
+      if (!isError && change) {
+        const { added, removed } = diffStat(change.before ?? "", change.after ?? "");
+        summary += " " + c.green(`+${added}`) + " " + c.red(`-${removed}`);
+      }
+      err(pad + c.dim("  ⎿ ") + summary);
+    },
     onInfo: (m) => err(pad + c.yellow(m)),
     confirm: async (tool, _args, reason) => {
       const hint = reason ? "only --yolo allows it" : "use --mode acceptEdits, --auto or --yolo";

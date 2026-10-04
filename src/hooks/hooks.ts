@@ -48,12 +48,14 @@ export async function runHooks(
   payload: Record<string, unknown>,
   cwd: string,
   toolName?: string,
+  signal?: AbortSignal,
 ): Promise<HookResult> {
   const result: HookResult = { blocked: false, feedback: "", context: "", warnings: [] };
   const commands = (config[event] ?? []).filter((m) => matches(m.matcher, toolName)).flatMap((m) => m.hooks);
   for (const hook of commands) {
     const input = JSON.stringify({ hook_event_name: event, cwd, ...payload });
-    const r = await runProcess("bash", ["-c", hook.command], { cwd, input, timeoutMs: (hook.timeout ?? 60) * 1000 });
+    const r = await runProcess("bash", ["-c", hook.command], { cwd, input, signal, timeoutMs: (hook.timeout ?? 60) * 1000 });
+    if (signal?.aborted) break; // Ctrl+C: skip the remaining hooks
     if (r.code === 2) {
       result.blocked = true;
       result.feedback += r.stderr.trim() + "\n";
