@@ -1,4 +1,3 @@
-import type { Interface } from "node:readline";
 import type { Completion, Item } from "./complete.ts";
 import { paintBelow } from "./footer.ts";
 import { c, stripAnsi } from "./render.ts";
@@ -52,7 +51,8 @@ export function menuRows(comp: Completion, sel: number, cols: number): string[] 
 }
 
 export interface MenuOptions {
-  rl: Interface;
+  /** readline.Interface or the LineEditor: the input line it edits */
+  rl: { line: string; cursor: number; prompt(preserveCursor?: boolean): void; getCursorPos(): { rows: number; cols: number }; getPrompt(): string };
   out: NodeJS.WriteStream;
   /** true only while the main prompt waits for input */
   active: () => boolean;
@@ -178,7 +178,8 @@ export class InputMenu {
     if (!rows.length && !this.shown) return;
     const cols = this.o.out.columns || 80;
     const pos = this.o.rl.getCursorPos();
-    const endRow = Math.floor((stripAnsi(this.o.rl.getPrompt()).length + this.r.line.length) / cols);
+    const ed = this.o.rl as unknown as { endRows?: () => number };
+    const endRow = ed.endRows ? ed.endRows() : Math.floor((stripAnsi(this.o.rl.getPrompt()).length + this.r.line.length) / cols);
     this.shown = paintBelow(this.o.out, rows, pos.cols, this.shown, Math.max(0, endRow - pos.rows));
   }
 }

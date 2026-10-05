@@ -1,8 +1,7 @@
 import { spawnSync } from "node:child_process";
-import type { Interface } from "node:readline";
 
 /** Shows text through $PAGER (default `less -R -F -X`) when it doesn't fit the terminal; otherwise just prints it. */
-export function page(text: string, rl?: Interface): void {
+export function page(text: string, rl?: { pause(): unknown; resume(): unknown }): void {
   const out = process.stdout;
   const body = text.endsWith("\n") ? text : text + "\n";
   const lines = body.split("\n").length - 1;

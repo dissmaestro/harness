@@ -2,7 +2,7 @@
 # Build from the local checkout (no network): ./build.sh   (extra args go to makepkg, e.g. --nocheck)
 
 pkgname=local-agent
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc="CLI coding agent for local models (llama.cpp, Ollama, vLLM) with lazy skills and deferred tools"
 arch=(any)

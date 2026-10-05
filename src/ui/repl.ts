@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { createInterface, emitKeypressEvents } from "node:readline";
+import { type Interface, createInterface, emitKeypressEvents } from "node:readline";
 import { PassThrough } from "node:stream";
 import { readText, type ChangeTracker } from "../core/changes.ts";
 import type { Agent, AgentUI, Approval, PlanDecision } from "../core/loop.ts";
@@ -15,6 +15,7 @@ import { diffStat, renderDiff } from "./diff.ts";
 import { langFromPath, lineHighlighter } from "./highlight.ts";
 import { type CommandInfo, SHORTCUTS, complete, expandMentions, projectFiles } from "./complete.ts";
 import { MarkdownStream } from "./markdown.ts";
+import { LineEditor } from "./editor.ts";
 import { InputMenu } from "./menu.ts";
 import { Footer, MutableOutput, columnAfter } from "./footer.ts";
 import { activitySummary, renderStatus } from "./status.ts";
@@ -87,6 +88,9 @@ function helpText(): string {
   ].join("\n");
 }
 
+/** keys the completion menu sends on (it speaks in escape sequences) */
+const SEQ_KEYS: Record<string, { name: string }> = { "\r": { name: "return" }, "\x1b[A": { name: "up" }, "\x1b[B": { name: "down" } };
+
 const AGENT_COLORS = [c.cyan, c.magenta, c.yellow, c.blue, c.green];
 const agentColor = (id: number) => AGENT_COLORS[(id - 1) % AGENT_COLORS.length];
 
@@ -143,11 +147,20 @@ export function parseViewSpec(spec: string): { path: string; start?: number; end
   return { path: m[1], start, end };
 }
 
+/** One entry per line; multi-line entries are stored as JSON strings ("…\n…"). */
 function loadHistory(file: string): string[] {
   try {
     const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
     if (lines.length > 1000) writeFileSync(file, lines.slice(-1000).join("\n") + "\n");
-    return lines.slice(-1000);
+    return lines.slice(-1000).map((l) => {
+      if (!l.startsWith('"')) return l;
+      try {
+        const v = JSON.parse(l);
+        return typeof v === "string" ? v : l;
+      } catch {
+        return l;
+      }
+    });
   } catch {
     return [];
   }
@@ -166,13 +179,17 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   const input = tty ? Object.assign(new PassThrough(), { isTTY: true, setRawMode: (on: boolean) => process.stdin.setRawMode(on) }) : process.stdin;
   // While agents work, readline's own echo is muted and the footer draws the typed line instead.
   let muted = () => false;
-  const rl = createInterface({
-    input,
-    output: tty ? (new MutableOutput(out, () => muted()) as unknown as NodeJS.WritableStream) : out,
-    historySize: 1000,
-    history: [...history].reverse(),
-    terminal: !!out.isTTY,
-  });
+  // In a terminal our own multi-line editor; readline only for piped input.
+  const editor = tty ? new LineEditor({ output: new MutableOutput(out, () => muted()), history: [...history].reverse(), historySize: 1000 }) : undefined;
+  const rl =
+    editor ??
+    createInterface({
+      input,
+      output: out,
+      historySize: 1000,
+      history: [...history].reverse(),
+      terminal: !!out.isTTY,
+    });
   const rlHistory = () => (rl as unknown as { history?: string[] }).history ?? [];
   let ctxWindow: number | undefined;
   let menu: InputMenu | undefined;
@@ -190,7 +207,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     if (!r.line) return c.green("› ") + c.inverse(" ") + c.dim(" ask what's going on · >note to the agent · >#2 note to subagent #2 · /status");
     const room = Math.max(10, (out.columns || 80) - 4);
     const start = Math.max(0, r.cursor - room + 1);
-    const text = r.line.slice(start, start + room);
+    // one row: new lines are shown as ↵ (same length, so the cursor index still fits)
+    const text = r.line.replace(/\n/g, "↵").slice(start, start + room);
     const cur = r.cursor - start;
     return c.green("› ") + text.slice(0, cur) + c.inverse(text[cur] ?? " ") + text.slice(cur + 1);
   };
@@ -254,7 +272,11 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     burstTimer = undefined;
     if (burst.length) deliver(burst.splice(0).join("\n"));
   };
-  rl.on("line", (l) => {
+  rl.on("line", (l: string) => {
+    if (editor) {
+      deliver(l); // the editor handles pastes and new lines itself: a line event is a whole message
+      return;
+    }
     if (pasting) {
       pasteBuf.push(l);
       return;
@@ -314,11 +336,11 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return a;
   };
   const remember = (input: string) => {
-    if (input.includes("\n") || input === history.at(-1)) return;
+    if (input === history.at(-1)) return;
     history.push(input);
     try {
       mkdirSync(dirname(historyFile), { recursive: true });
-      appendFileSync(historyFile, input + "\n");
+      appendFileSync(historyFile, (input.includes("\n") || input.startsWith('"') ? JSON.stringify(input) : input) + "\n");
     } catch {
       // history is a convenience
     }
@@ -370,9 +392,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       if (k?.name === "paste-start") pasting = true;
       else if (k?.name === "paste-end") pasting = false;
       else if (k?.name === "tab" && k.shift && !pasting) agent.setMode(nextMode(agent.mode));
-      const forward = (seq: string) => input.write(seq);
+      const forward = (seq: string) => (editor ? editor.feed(seq, SEQ_KEYS[seq] ?? { sequence: seq }) : input.write(seq));
       if (!pasting && menu!.key(k, forward)) return;
-      forward(k?.sequence ?? s);
+      if (editor) editor.feed(s, k);
+      else forward(k?.sequence ?? s);
       setImmediate(() => {
         menu!.update();
         footer.draw();
@@ -405,8 +428,11 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     }
     const r = rl as unknown as { line: string };
     if (r.line) {
-      rl.write(null, { ctrl: true, name: "e" });
-      rl.write(null, { ctrl: true, name: "u" });
+      if (editor) editor.clear();
+      else {
+        (rl as Interface).write(null as never, { ctrl: true, name: "e" });
+        (rl as Interface).write(null as never, { ctrl: true, name: "u" });
+      }
       return;
     }
     if (waiter && waiterFresh) {
@@ -872,7 +898,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     let rawInput = await nextLine(promptFor(agent.mode));
     if (rawInput === null) break;
     // a trailing backslash continues the input on the next line
-    while (rawInput.endsWith("\\")) {
+    while (!editor && rawInput.endsWith("\\")) {
       const more = await nextLine(c.gray("… "));
       if (more === null) break;
       rawInput = rawInput.slice(0, -1) + "\n" + more;
