@@ -25,9 +25,9 @@ export async function runHeadless(agent: Agent, prompt: string, warnings: string
       err(pad + c.yellow(`  denied ${tool.name}${reason ? ` (${reason})` : ""}: nobody to ask in -p mode; ${hint}`));
       return "no";
     },
-    child: (label) => {
-      err(pad + c.magenta(`◆ subagent ${label}`));
-      return makeUI(pad + "  │ ");
+    child: (label, id) => {
+      err(pad + c.magenta(`◆ subagent${id ? ` #${id}` : ""} ${label}`));
+      return makeUI(id ? `  #${id} │ ` : pad + "  │ ");
     },
   });
   const ac = new AbortController();

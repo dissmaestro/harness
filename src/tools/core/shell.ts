@@ -1,8 +1,7 @@
-import { mkdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Tool } from "../../types.ts";
-import { resolvePath, runProcess, truncateMiddle } from "../../util.ts";
+import { resolvePath, runProcess, saveFullOutput, truncateMiddle } from "../../util.ts";
 
 const BASH_MAX_OUTPUT = 16_000;
 /** Grep content mode budget (a 64k context fills fast) */
@@ -11,19 +10,6 @@ const GREP_MAX_COLUMNS = 300;
 const MAX_PATHS = 200;
 /** search hidden files too (.github, .env.example…), but never inside .git */
 const RG_HIDDEN = ["--hidden", "--glob", "!.git"];
-
-/** Saves long command output so the model can page through it instead of losing the middle. */
-function saveFullOutput(out: string): string | undefined {
-  try {
-    const dir = join(tmpdir(), "agent-output");
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.log`);
-    writeFileSync(file, out);
-    return file;
-  } catch {
-    return undefined;
-  }
-}
 
 export const Bash: Tool = {
   name: "Bash",

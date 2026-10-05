@@ -17,6 +17,15 @@ export interface WebSearchConfig {
   apiKey?: string;
 }
 
+export interface SubagentsConfig {
+  /** prefer: the main agent coordinates and hands searches, reading and independent subtasks to subagents */
+  delegate: "prefer" | "normal";
+  /** how many subagents run at the same time (Agent calls in one reply) */
+  parallel: number;
+  /** auto: writing subagents that run in parallel get their own git worktree; always; off */
+  worktree: "auto" | "always" | "off";
+}
+
 export interface Settings {
   /** OpenAI-compatible endpoint: llama-server, Ollama (http://localhost:11434/v1), vLLM, LM Studio */
   baseUrl: string;
@@ -37,6 +46,7 @@ export interface Settings {
   claudeCompat: boolean;
   hooks: HooksConfig;
   mcpServers: Record<string, McpServerConfig>;
+  subagents: SubagentsConfig;
 }
 
 const DEFAULTS: Settings = {
@@ -49,6 +59,7 @@ const DEFAULTS: Settings = {
   claudeCompat: true,
   hooks: {},
   mcpServers: {},
+  subagents: { delegate: "prefer", parallel: 3, worktree: "auto" },
 };
 
 function readJson(path: string): Partial<Settings> {
@@ -62,11 +73,12 @@ function readJson(path: string): Partial<Settings> {
 
 /** User settings (~/.agent/settings.json), then project (.agent/settings.json); env vars win. */
 export function loadSettings(cwd: string, home = homedir()): Settings {
-  const s: Settings = { ...DEFAULTS, hooks: {}, mcpServers: {}, webSearch: { ...DEFAULTS.webSearch } };
+  const s: Settings = { ...DEFAULTS, hooks: {}, mcpServers: {}, webSearch: { ...DEFAULTS.webSearch }, subagents: { ...DEFAULTS.subagents } };
   for (const file of [join(home, ".agent", "settings.json"), join(cwd, ".agent", "settings.json")]) {
-    const { hooks, mcpServers, webSearch, ...rest } = readJson(file);
+    const { hooks, mcpServers, webSearch, subagents, ...rest } = readJson(file);
     Object.assign(s, rest);
     if (webSearch) Object.assign(s.webSearch, webSearch);
+    if (subagents) Object.assign(s.subagents, subagents);
     if (mcpServers) Object.assign(s.mcpServers, mcpServers);
     for (const [event, list] of Object.entries(hooks ?? {})) {
       const key = event as keyof HooksConfig;

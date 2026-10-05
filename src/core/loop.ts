@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { join, relative } from "node:path";
 import { runHooks, type HookResult } from "../hooks/hooks.ts";
 import { ChatError, chat, fetchContextWindow, isContextOverflow, type ChatResult, type Timings, type Usage } from "../providers/openai.ts";
 import { extractTextToolCalls, looksTruncated, parseJsonLenient, stripThinking } from "../providers/toolcall-parse.ts";
@@ -6,9 +7,10 @@ import type { AgentDef, Registry } from "../registry/registry.ts";
 import { EXIT_PLAN_MODE } from "../tools/session-tools.ts";
 import { USE_TOOL } from "../tools/UseTool.ts";
 import type { Message, Session, Tool, ToolCall, ToolContext } from "../types.ts";
-import { oneLine, resolvePath, truncateMiddle } from "../util.ts";
+import { oneLine, resolvePath, saveFullOutput, truncateMiddle } from "../util.ts";
 import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
+import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, type Mode } from "./modes.ts";
 import { SessionJournal, readSession, sanitizeHistory } from "./sessions.ts";
@@ -42,8 +44,8 @@ export interface AgentUI {
   confirm(tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval>;
   /** interactive plan approval; without it plans are returned to the caller as text */
   approvePlan?(plan: string): Promise<PlanDecision>;
-  /** UI for a subagent's activity (e.g. indented); defaults to this UI */
-  child?(label: string): AgentUI;
+  /** UI for a subagent's activity (e.g. indented); `id` is its number on the activity board */
+  child?(label: string, id?: number): AgentUI;
 }
 
 export interface AgentOptions {
@@ -65,6 +67,13 @@ export interface AgentOptions {
 }
 
 const MAX_STOP_HOOK_RETRIES = 3;
+/** a subagent's report longer than this is cut (the full text is saved to a file) to protect the main context */
+const REPORT_MAX = 8_000;
+
+export interface SubagentRunOptions {
+  /** run a writing subagent in its own git worktree and merge its changes back afterwards */
+  isolate?: boolean;
+}
 const DEFAULT_CONTEXT = 32_768;
 /** a text answer cut off by the token limit is continued automatically this many times */
 const MAX_CONTINUATIONS = 2;
@@ -414,27 +423,43 @@ export class Agent {
       answer = "";
 
       let stopReason: string | undefined;
-      for (const [i, call] of calls.entries()) {
-        let result: string;
-        if (signal.aborted) result = "Tool call cancelled: the user interrupted.";
-        else if (stopReason) result = "Not executed: the turn was stopped.";
-        else if (cutOff && (i === calls.length - 1 || looksTruncated(call.function.arguments))) {
+      const runOne = async (call: ToolCall, i: number, opts: SubagentRunOptions = {}): Promise<string> => {
+        if (signal.aborted) return "Tool call cancelled: the user interrupted.";
+        if (stopReason) return "Not executed: the turn was stopped.";
+        if (cutOff && (i === calls.length - 1 || looksTruncated(call.function.arguments))) {
           // finish_reason "length": the last call was being written when the limit hit; lenient JSON repair
           // would otherwise run it with half its content (e.g. a Write of a truncated file).
-          result = TRUNCATED_CALL;
           ui.onToolStart(call.function.name, {});
-          ui.onToolEnd(call.function.name, result, true);
-        } else {
-          result = await this.execCall(call, ui, signal);
-          const key = `${call.function.name}\0${canonicalArgs(call.function.arguments)}`;
-          const n = (repeats.get(key) ?? 0) + 1;
-          repeats.set(key, n);
-          if (n >= REPEAT_STOP) {
-            stopReason = `The model repeated the same ${call.function.name} call ${n} times; stopping this turn.`;
-          } else if (n >= REPEAT_WARN) {
-            result += `\n\n${reminder(`You have made this exact ${call.function.name} call ${n} times in this task. Repeating it will not give a different result: change your approach, or stop and tell the user what is blocking you.`)}`;
-          }
+          ui.onToolEnd(call.function.name, TRUNCATED_CALL, true);
+          return TRUNCATED_CALL;
         }
+        let result = await this.execCall(call, ui, signal, opts);
+        const key = `${call.function.name}\0${canonicalArgs(call.function.arguments)}`;
+        const n = (repeats.get(key) ?? 0) + 1;
+        repeats.set(key, n);
+        if (n >= REPEAT_STOP) {
+          stopReason = `The model repeated the same ${call.function.name} call ${n} times; stopping this turn.`;
+        } else if (n >= REPEAT_WARN) {
+          result += `\n\n${reminder(`You have made this exact ${call.function.name} call ${n} times in this task. Repeating it will not give a different result: change your approach, or stop and tell the user what is blocking you.`)}`;
+        }
+        return result;
+      };
+
+      // Consecutive Agent calls run in parallel; everything else runs in order, one at a time.
+      const results: string[] = new Array(calls.length);
+      for (let i = 0; i < calls.length; ) {
+        let j = i;
+        while (j < calls.length && calls[j].function.name === "Agent") j++;
+        if (j - i > 1 && !this.subagent) {
+          await this.runAgentBatch(calls.slice(i, j), (call, k, opts) => runOne(call, i + k, opts), results, i);
+          i = j;
+        } else {
+          results[i] = await runOne(calls[i], i, j > i ? this.isolationFor([calls[i]])(calls[i]) : {});
+          i++;
+        }
+      }
+      for (const [i, call] of calls.entries()) {
+        let result = results[i];
         // Mode changes and notes typed by the user while the model works go with the next tool result (append-only).
         if (this.pendingReminders.length) result += "\n\n" + this.pendingReminders.splice(0).map(reminder).join("\n");
         if (this.activity.notes.length) result += "\n\n" + reminder(USER_NOTES(this.activity.notes.splice(0)));
@@ -451,7 +476,7 @@ export class Agent {
 
   // ---------- tools ----------
 
-  private async execCall(call: ToolCall, ui: AgentUI, signal: AbortSignal): Promise<string> {
+  private async execCall(call: ToolCall, ui: AgentUI, signal: AbortSignal, opts: SubagentRunOptions = {}): Promise<string> {
     // Servers sometimes glue two XML tool calls into one garbled name ("WebFetch>\n</function>…"): keep the first word.
     let name = /^[\w.-]+$/.test(call.function.name) ? call.function.name : (call.function.name.match(/^[\w.-]+/)?.[0] ?? call.function.name);
     const fail = (msg: string, args: Record<string, unknown> = {}) => {
@@ -494,13 +519,13 @@ export class Agent {
     if (name === "TodoWrite" && Array.isArray(args.todos)) this.activity.update({ todos: args.todos as Todo[] });
     this.activity.update({ tool: { name, summary: this.board.toolSummary(name, args), since: Date.now() } });
     try {
-      return await this.execPermitted(name, tool, args, ui, signal);
+      return await this.execPermitted(name, tool, args, ui, signal, opts);
     } finally {
       this.activity.update({ tool: undefined });
     }
   }
 
-  private async execPermitted(name: string, tool: Tool, args: Record<string, unknown>, ui: AgentUI, signal: AbortSignal): Promise<string> {
+  private async execPermitted(name: string, tool: Tool, args: Record<string, unknown>, ui: AgentUI, signal: AbortSignal, opts: SubagentRunOptions): Promise<string> {
     const permission = await this.permit(tool, args, ui);
     if (permission !== true) {
       ui.onToolEnd(name, permission, true);
@@ -522,7 +547,7 @@ export class Agent {
       signal,
       registry: this.registry,
       readFiles: this.readFiles,
-      session: this.subagent ? undefined : this.session(ui, signal),
+      session: this.subagent ? undefined : this.session(ui, signal, opts),
     };
     const file = tool.kind === "edit" && typeof args.file_path === "string" ? resolvePath(this.cwd, args.file_path) : undefined;
     if (file) this.changes.beforeWrite(file, name);
@@ -581,46 +606,149 @@ export class Agent {
     return answer === "no" ? "The user denied this tool call. Ask them how to proceed or try a different approach." : true;
   }
 
-  private session(ui: AgentUI, signal: AbortSignal): Session {
+  private session(ui: AgentUI, signal: AbortSignal, opts: SubagentRunOptions = {}): Session {
     return {
       mode: () => this.mode,
-      runSubagent: (type, prompt, description) => this.runSubagent(type, prompt, description, ui, signal),
+      runSubagent: (type, prompt, description) => this.runSubagent(type, prompt, description, ui, signal, opts),
       approvePlan: (plan) => this.approvePlan(plan, ui),
     };
   }
 
-  private async runSubagent(type: string, prompt: string, description: string, ui: AgentUI, signal: AbortSignal): Promise<string> {
+  private writesFiles(call: ToolCall): boolean {
+    let type: unknown;
+    try {
+      type = (parseJsonLenient(call.function.arguments) as Record<string, unknown> | undefined)?.subagent_type;
+    } catch {}
+    const def = typeof type === "string" ? this.registry.agents.get(type) : undefined;
+    return !!def && !def.readOnly;
+  }
+
+  /** Which of these Agent calls get their own git worktree. */
+  private isolationFor(batch: ToolCall[]): (call: ToolCall) => SubagentRunOptions {
+    const mode = this.settings.subagents?.worktree ?? "auto";
+    const writers = batch.filter((c) => this.writesFiles(c)).length;
+    const wanted = mode === "always" ? writers > 0 : mode === "auto" && writers > 1;
+    const isolate = wanted && !!gitRoot(this.cwd);
+    return (call) => ({ isolate: isolate && this.writesFiles(call) });
+  }
+
+  /**
+   * Runs Agent calls at the same time (up to subagents.parallel). Writing subagents get worktrees when
+   * there is more than one of them; without git they take turns so they never edit the same tree at once.
+   */
+  private async runAgentBatch(
+    batch: ToolCall[],
+    run: (call: ToolCall, k: number, opts: SubagentRunOptions) => Promise<string>,
+    results: string[],
+    offset: number,
+  ): Promise<void> {
+    const opts = this.isolationFor(batch);
+    const writers = batch.filter((c) => this.writesFiles(c));
+    const takeTurns = writers.length > 1 && !opts(writers[0]).isolate;
+    let writerChain: Promise<unknown> = Promise.resolve();
+    const limit = Math.max(1, this.settings.subagents?.parallel ?? 3);
+    let next = 0;
+    const worker = async () => {
+      while (next < batch.length) {
+        const k = next++;
+        const call = batch[k];
+        const go = () => run(call, k, opts(call));
+        if (takeTurns && this.writesFiles(call)) {
+          const p = writerChain.then(go);
+          writerChain = p.catch(() => {});
+          results[offset + k] = await p;
+        } else results[offset + k] = await go();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, batch.length) }, worker));
+  }
+
+  private async runSubagent(type: string, prompt: string, description: string, ui: AgentUI, signal: AbortSignal, opts: SubagentRunOptions = {}): Promise<string> {
     const def = this.registry.agents.get(type);
     if (!def) throw new Error(`Unknown subagent type "${type}". Available: ${[...this.registry.agents.keys()].join(", ")}.`);
     const activity = this.board.add(this.activity, def.name, description, 30);
+    const childUi = ui.child?.(`${def.name}${description ? `: ${description}` : ""}`, activity.id) ?? ui;
+
+    let wt: Worktree | undefined;
+    let cwd = this.cwd;
+    if (opts.isolate && !def.readOnly) {
+      const root = gitRoot(this.cwd);
+      try {
+        if (!root) throw new Error("not a git repository");
+        wt = createWorktree(root, `${activity.id}-${Date.now().toString(36)}`, this.home);
+        cwd = join(wt.path, relative(root, this.cwd));
+        activity.update({ worktree: wt.path });
+        childUi.onInfo(`working in its own git worktree: ${wt.path}`);
+      } catch (e) {
+        childUi.onInfo(`could not create a git worktree (${(e as Error).message}); working in the project folder`);
+      }
+    }
+
     const child = new Agent({
-      cwd: this.cwd,
+      cwd,
       settings: this.settings,
       registry: this.registry,
       home: this.home,
       subagent: def,
       mode: this.mode,
-      changes: this.changes,
+      changes: wt ? new ChangeTracker() : this.changes,
       board: this.board,
       activity,
     });
     child.sessionAllowed = this.sessionAllowed;
     child.parent = this.parent ?? this;
-    const childUi = ui.child?.(`${def.name}${description ? `: ${description}` : ""}`) ?? ui;
     let answer: string;
+    let failed: string | undefined;
     try {
       answer = await child.send(prompt, childUi, signal);
       activity.finish("done");
     } catch (e) {
       activity.finish("failed");
-      if (signal.aborted) throw e;
+      if (signal.aborted) {
+        if (wt) childUi.onInfo(`interrupted; its worktree is kept: ${wt.path}`);
+        throw e;
+      }
       // The subagent died (server gone for longer than the retry window, a bug…): hand back what it had
       // done so far instead of losing it, so the parent can continue or re-delegate the rest.
       childUi.onInfo(`subagent failed: ${(e as Error).message}`);
-      return `The ${def.name} subagent failed before finishing: ${(e as Error).message}\n\n${child.progressReport()}\n\nYou can call the Agent tool again with a narrower prompt to finish the rest, or continue yourself.`;
+      failed = (e as Error).message;
+      answer = "";
     }
-    const used = child.contextUsed();
-    return `${answer.trim() || child.progressReport()}\n\n[subagent ${def.name} used ~${used} tokens of its own context]`;
+
+    let report = failed
+      ? `The ${def.name} subagent failed before finishing: ${failed}\n\n${child.progressReport()}\n\nYou can call the Agent tool again with a narrower prompt to finish the rest, or continue yourself.`
+      : answer.trim() || child.progressReport();
+    if (report.length > REPORT_MAX) {
+      const file = saveFullOutput(report, "md");
+      report = truncateMiddle(report, REPORT_MAX) + (file ? `\n\n[the full report is in ${file}; Read it only if you need the missing part]` : "");
+    }
+    if (wt) report += `\n\n${this.mergeWorktree(wt, childUi)}`;
+    return failed ? report : `${report}\n\n[subagent ${def.name} used ~${child.contextUsed()} tokens of its own context]`;
+  }
+
+  /** Merges a subagent's worktree back into the project and describes the outcome for the model. */
+  private mergeWorktree(wt: Worktree, ui: AgentUI): string {
+    let m: MergeResult;
+    try {
+      m = mergeBack(wt, this.changes);
+    } catch (e) {
+      ui.onInfo(`could not merge its worktree: ${(e as Error).message}; kept at ${wt.path}`);
+      return `[The subagent worked in a git worktree, but merging it failed (${(e as Error).message}). Its files are still at ${wt.path}.]`;
+    }
+    // merged files changed behind the main agent's back: it must re-read them before editing
+    for (const p of [...m.merged, ...m.conflicts]) this.readFiles.delete(join(wt.root, p));
+    const parts = [`[The subagent worked in its own git worktree. Merged into the project: ${m.merged.join(", ") || "no changes"}.`];
+    if (m.conflicts.length) parts.push(`CONFLICTS (both sides changed the same lines; conflict markers <<<<<<< project / >>>>>>> subagent were written, resolve them): ${m.conflicts.join(", ")}.`);
+    if (m.skipped.length) parts.push(`Not merged (binary or deleted on one side; the project's version was kept): ${m.skipped.join(", ")}. The subagent's version is in ${wt.path}.`);
+    if (m.conflicts.length || m.skipped.length) {
+      ui.onInfo(`merged with problems: ${[...m.conflicts, ...m.skipped].join(", ")}; worktree kept at ${wt.path}`);
+      parts.push(`The worktree is kept at ${wt.path}.]`);
+    } else {
+      removeWorktree(wt);
+      if (m.merged.length) ui.onInfo(`merged ${m.merged.length} file${m.merged.length === 1 ? "" : "s"} from its worktree: ${m.merged.join(", ")}`);
+      parts[parts.length - 1] += "]";
+    }
+    return parts.join(" ");
   }
 
   /** What this agent said and did so far (used when a subagent can't give a proper final report). */

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 
 /** Version from package.json (shown by --version, sent to MCP servers). */
 export const VERSION: string = (() => {
@@ -18,6 +18,19 @@ export function resolvePath(cwd: string, p: string): string {
 }
 
 /** Keeps head and tail of long output; the middle is usually the least useful part. */
+/** Saves long output (a command's, a subagent's report) so the model can page through it instead of losing the middle. */
+export function saveFullOutput(out: string, ext = "log"): string | undefined {
+  try {
+    const dir = join(tmpdir(), "agent-output");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}-${Math.random().toString(36).slice(2, 6)}.${ext}`);
+    writeFileSync(file, out);
+    return file;
+  } catch {
+    return undefined;
+  }
+}
+
 export function truncateMiddle(s: string, max = 16_000): string {
   if (s.length <= max) return s;
   const half = Math.floor(max / 2);

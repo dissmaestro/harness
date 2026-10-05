@@ -79,6 +79,9 @@ function helpText(): string {
   ].join("\n");
 }
 
+const AGENT_COLORS = [c.cyan, c.magenta, c.yellow, c.blue, c.green];
+const agentColor = (id: number) => AGENT_COLORS[(id - 1) % AGENT_COLORS.length];
+
 /** Tools whose results are shown as a diff of the file they wrote. */
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
@@ -450,7 +453,14 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     }
   };
 
-  const confirm = async (pad: string, tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval> => {
+  // Parallel subagents may ask at the same time: questions are shown one after another.
+  let confirmChain: Promise<unknown> = Promise.resolve();
+  const confirm = (pad: string, tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval> => {
+    const p = confirmChain.then(() => confirmOne(pad, tool, args, reason));
+    confirmChain = p.catch(() => {});
+    return p;
+  };
+  const confirmOne = async (pad: string, tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval> => {
     endText();
     const w = width() - 8;
     const body: string[] = [];
@@ -485,8 +495,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return { approved: false, feedback };
   };
 
-  const makeUI = (depth: number): AgentUI => {
-    const pad = depth ? c.gray("  │ ".repeat(depth)) : "";
+  const makeUI = (depth: number, id?: number): AgentUI => {
+    // a subagent's lines carry its number in its own color, so parallel subagents can be told apart
+    const pad = depth ? (id ? agentColor(id)(`  #${id} │ `) : c.gray("  │ ".repeat(depth))) : "";
     // args of started calls per tool name, matched to their results in order (sequential and parallel calls)
     const started = new Map<string, Record<string, unknown>[]>();
     return {
@@ -515,9 +526,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       onInfo: (m) => line(pad + c.yellow(`  ${m}`)),
       confirm: (tool, args, reason) => confirm(pad, tool, args, reason),
       approvePlan: depth ? undefined : approvePlan,
-      child: (label) => {
-        line(pad + c.magenta("  ◆ ") + c.bold("subagent ") + c.dim(label));
-        return makeUI(depth + 1);
+      child: (label, childId) => {
+        line(pad + c.magenta("  ◆ ") + c.bold(`subagent${childId ? ` #${childId}` : ""} `) + c.dim(label));
+        return makeUI(depth + 1, childId);
       },
     };
   };

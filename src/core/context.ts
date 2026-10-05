@@ -13,7 +13,6 @@ const BASE_PROMPT = `You are a coding agent running in the user's terminal. You 
 - Keep answers short. Don't repeat file contents back to the user.
 - If a tool returns an error, read it carefully, fix the call and retry.
 - For tasks with 3+ steps, keep a checklist with TodoWrite and update it as you go.
-- Use the Agent tool for broad exploration or web research that would otherwise fill your context with file contents; give the subagent a complete, self-contained prompt.
 - Web access: WebSearch and WebFetch are deferred tools (load them with ToolSearch). Use them for documentation, error messages and anything that may be newer than your knowledge.
 
 # Skills and deferred tools
@@ -63,8 +62,22 @@ export function buildSystemPrompt(cwd: string, settings: Settings, home = homedi
       .filter(Boolean)
       .join("\n\n");
   }
-  return [BASE_PROMPT, env, ...instructions].join("\n\n");
+  return [BASE_PROMPT, settings.subagents?.delegate === "normal" ? DELEGATION_NORMAL : DELEGATION_PREFER, env, ...instructions].join("\n\n");
 }
+
+const DELEGATION_NORMAL = `# Subagents
+- Use the Agent tool for broad exploration or web research that would otherwise fill your context with file contents; give the subagent a complete, self-contained prompt.
+- Several Agent calls in one reply run in parallel.`;
+
+const DELEGATION_PREFER = `# Delegation: you are the coordinator
+Your context is small and must last the whole session. Hand work to subagents with the Agent tool and keep for yourself only planning, decisions and precise edits.
+- Searching the codebase, reading more than 2-3 files, tracing a flow, reviewing a diff: delegate to "explore".
+- Questions about libraries, APIs, errors, documentation: delegate to "web-researcher".
+- Independent subtasks (fix module A, write tests for B, update docs): delegate each to "general-purpose".
+- Put independent Agent calls in ONE reply: they run in parallel. Writing subagents that run in parallel each get their own copy of the project (git worktree) and their changes are merged back afterwards, so give them tasks that touch different files.
+- Every subagent prompt must be self-contained: the goal, relevant paths and facts you already know, constraints, and exactly what to report back. The subagent sees none of this conversation.
+- Trust the reports: don't re-read the files a subagent already summarized; read a file yourself only right before editing it.
+- Do it yourself when it is a small, local change (one file you already know) or when the subagent would need most of your context.`;
 
 export function reminder(text: string): string {
   return `<system-reminder>\n${text}\n</system-reminder>`;

@@ -63,7 +63,7 @@ export function agentTool(registry: Registry): Tool {
     description:
       "Run a subagent with a fresh, separate context for a self-contained task; only its final report comes back. " +
       "Use it to keep your own context small: broad code exploration, web research, investigating a bug in parallel " +
-      "to your main work. Give a complete prompt: the subagent sees none of this conversation.\nAvailable types:\n" +
+      "to your main work. Several Agent calls in one reply run in parallel. Give a complete prompt: the subagent sees none of this conversation.\nAvailable types:\n" +
       types,
     parameters: {
       type: "object",
