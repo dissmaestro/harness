@@ -100,3 +100,31 @@ test("fork: a new session that starts as a copy; the original is kept and listed
     srv.close();
   }
 });
+
+test("checkpoints refuse the home folder, never snapshot ~/.agent, and skip huge folders", async () => {
+  const { Checkpoints } = await import("../src/core/checkpoints.ts");
+  const { execFileSync } = await import("node:child_process");
+  const home = tempDir();
+  writeFileSync(join(home, "notes.txt"), "x");
+  const inHome = new Checkpoints(home, home);
+  assert.equal(await inHome.snapshot({ turn: "t", history: 1, before: "x" }), undefined);
+  assert.match(inHome.disabled!, /home folder/);
+
+  // a project that contains the agent's data folder (home is inside the project here)
+  const project = tempDir();
+  const nestedHome = join(project, "user");
+  mkdirSync(join(nestedHome, ".agent", "sessions"), { recursive: true });
+  writeFileSync(join(nestedHome, ".agent", "sessions", "s.jsonl"), "{}\n");
+  writeFileSync(join(project, "main.py"), "print(1)\n");
+  const store = new Checkpoints(project, nestedHome);
+  await store.snapshot({ turn: "a", history: 1, before: "x" });
+  const cp = await store.snapshot({ turn: "b", history: 3, before: "y" });
+  const files = execFileSync("git", [`--git-dir=${store.gitDir}`, "ls-tree", "-r", "--name-only", cp!.commit], { encoding: "utf8" }).trim().split("\n");
+  assert.deepEqual(files, ["main.py"]);
+
+  const big = tempDir();
+  for (let i = 0; i < 20_001; i++) writeFileSync(join(big, `f${i}`), "");
+  const huge = new Checkpoints(big, tempDir());
+  assert.equal(await huge.snapshot({ turn: "t", history: 1, before: "x" }), undefined);
+  assert.match(huge.disabled!, /more than 20000 files/);
+});

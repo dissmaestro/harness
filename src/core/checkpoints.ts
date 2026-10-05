@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { runProcess } from "../util.ts";
 
 /**
@@ -33,6 +33,8 @@ const IDENTITY = {
 
 /** the first snapshot of a huge folder (hashing every file) must not stall the agent forever */
 const FIRST_SNAPSHOT_LIMIT_MS = 20_000;
+/** more files than this (after .gitignore) is not a project folder: snapshots would copy too much */
+const MAX_FILES = 20_000;
 
 export class Checkpoints {
   readonly list: Checkpoint[] = [];
@@ -40,11 +42,13 @@ export class Checkpoints {
   disabled: string | undefined;
   readonly gitDir: string;
   private cwd: string;
+  private home: string;
   private ready: Promise<void> | undefined;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string, home = homedir()) {
     this.cwd = cwd;
+    this.home = home;
     const hash = createHash("sha1").update(cwd).digest("hex").slice(0, 10);
     this.gitDir = join(home, ".agent", "checkpoints", `${basename(cwd) || "root"}-${hash}`);
   }
@@ -67,12 +71,29 @@ export class Checkpoints {
         if (r.code !== 0) throw new Error(r.stderr.trim() || "git init failed");
         mkdirSync(join(this.gitDir, "info"), { recursive: true });
         // nested repositories and dependency folders are not ours to snapshot (.gitignore is honoured as well)
-        writeFileSync(join(this.gitDir, "info", "exclude"), ".git\nnode_modules/\n.venv/\n__pycache__/\n");
+        // the agent's own data (~/.agent: checkpoints, sessions, worktrees) must never end up in a snapshot of a
+        // folder that contains it, or every snapshot would copy the previous ones
+        const own = relative(this.cwd, join(this.home, ".agent"));
+        const ownLine = own && !own.startsWith("..") && !isAbsolute(own) ? `/${own}/\n` : "";
+        writeFileSync(join(this.gitDir, "info", "exclude"), `.git\nnode_modules/\n.venv/\n__pycache__/\n${ownLine}`);
         await this.git(["config", "core.autocrlf", "false"]);
       }
       void runProcess("git", [`--git-dir=${this.gitDir}`, "gc", "--auto", "-q"], { cwd: this.cwd });
     })();
     return this.ready;
+  }
+
+  /** Whether the folder has at most MAX_FILES files to snapshot (listing only: nothing is hashed yet). */
+  private async small(): Promise<boolean> {
+    const r = await runProcess("git", [`--git-dir=${this.gitDir}`, `--work-tree=${this.cwd}`, "ls-files", "-o", "-c", "--exclude-standard", "-z"], {
+      cwd: this.cwd,
+      env: { ...process.env, GIT_INDEX_FILE: join(this.gitDir, "index") },
+      timeoutMs: 15_000,
+    });
+    if (r.code !== 0) return !r.timedOut;
+    let n = 0;
+    for (let i = r.stdout.indexOf("\0"); i >= 0 && n <= MAX_FILES; i = r.stdout.indexOf("\0", i + 1)) n++;
+    return n <= MAX_FILES;
   }
 
   /** git add -A + write-tree in the shadow index: the tree id of the folder as it is now */
@@ -99,7 +120,18 @@ export class Checkpoints {
     const first = !this.list.length;
     const t0 = Date.now();
     try {
+      if (first) {
+        const cwd = resolve(this.cwd);
+        if (cwd === resolve(this.home) || cwd === "/") {
+          this.disabled = "checkpoints are off: the home folder and / are not snapshotted (start the agent in a project folder)";
+          return undefined;
+        }
+      }
       await this.init();
+      if (first && !(await this.small())) {
+        this.disabled = `checkpoints are off: more than ${MAX_FILES} files here after .gitignore (a project folder, or add the bulk to .gitignore)`;
+        return undefined;
+      }
       const tree = await this.currentTree();
       const last = this.list.at(-1);
       if (last && last.tree === tree && last.turn === meta.turn && last.history === meta.history) return last;

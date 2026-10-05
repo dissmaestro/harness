@@ -508,6 +508,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return p;
   };
   const confirmOne = async (pad: string, tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval> => {
+    // after Ctrl+C, questions still queued from parallel subagents must not show up and take the prompt
+    if (!running || running.signal.aborted) return "no";
     endText();
     const w = width() - 8;
     const body: string[] = [];

@@ -101,3 +101,27 @@ test("end to end: Qwen3.6 request body, reasoning replayed within the task, drop
     srv.close();
   }
 });
+
+test("a server that rejects the profile's extra fields gets one retry without them, then plain requests", async () => {
+  const srv = await fakeServer((body) =>
+    "top_k" in body || "chat_template_kwargs" in body
+      ? { status: 400, body: { error: { message: "litellm.UnsupportedParamsError: openai does not support parameters: ['top_k', 'chat_template_kwargs']" } } }
+      : text("ok"),
+  );
+  try {
+    const cwd = tempDir();
+    const home = tempDir();
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url, model: "qwen3.6", repoMap: false as const };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home });
+    const log: string[] = [];
+    assert.equal(await agent.send("hi", silentUI(log), new AbortController().signal), "ok");
+    assert.equal(await agent.send("again", silentUI(log), new AbortController().signal), "ok");
+    assert.equal(srv.requests.length, 3, "one rejected request, then plain ones");
+    assert.equal(srv.requests[1].top_k, undefined);
+    assert.equal(srv.requests[1].temperature, 0.6, "standard fields stay");
+    assert.ok(log.some((l) => /rejected the profile's extra fields/.test(l)));
+  } finally {
+    srv.close();
+  }
+});

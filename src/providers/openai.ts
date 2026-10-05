@@ -105,6 +105,11 @@ async function waitForHealth(settings: Settings, deadline: number, signal?: Abor
  * cut-off streams with exponential backoff, and waits for llama-server to finish loading a model.
  * `onRetry` reports each attempt; text streamed by a failed attempt is regenerated from scratch.
  */
+/** Servers (by URL) that rejected the non-standard fields a profile adds: they get plain requests from then on. */
+const plainServers = new Set<string>();
+const NONSTANDARD_REJECTED =
+  /chat_template_kwargs|top_k|min_p|reasoning_content|Unrecognized request argument|extra (?:fields|inputs) not permitted|extra_forbidden|unsupported param|unknown (?:field|parameter|argument)/i;
+
 export async function chat(settings: Settings, req: ChatRequest & { onRetry?: (message: string) => void }): Promise<ChatResult> {
   const cfg = { ...DEFAULT_RETRY, ...(settings as Settings & { retry?: Partial<RetryConfig> }).retry };
   const deadline = Date.now() + cfg.maxSeconds * 1000;
@@ -114,6 +119,14 @@ export async function chat(settings: Settings, req: ChatRequest & { onRetry?: (m
     } catch (e) {
       if (req.signal?.aborted) throw e;
       const err = e instanceof ChatError ? e : new ChatError((e as Error).message, { retryable: NETWORK_ERROR.test(String((e as Error).message) + String((e as any)?.cause?.code ?? "")) });
+      // A proxy (LiteLLM, OpenAI itself) may refuse top_k / min_p / chat_template_kwargs: drop them once and go on.
+      const url = resolveRequest(settings, req.role).baseUrl;
+      if (err.status === 400 && NONSTANDARD_REJECTED.test(err.message) && !plainServers.has(url)) {
+        plainServers.add(url);
+        req.onRetry?.("The server rejected the profile's extra fields (top_k, min_p, chat_template_kwargs): retrying without them for this session. Set them on the server instead (see docs).");
+        attempt--;
+        continue;
+      }
       if (!err.retryable || Date.now() >= deadline) throw err;
       const delay = Math.min(err.retryAfterMs ?? 1000 * 2 ** (attempt - 1), 30_000) * (0.8 + Math.random() * 0.4);
       const why = err.status ? `HTTP ${err.status}` : err.message.replace(/^LLM request failed: /, "").slice(0, 80);
@@ -124,7 +137,6 @@ export async function chat(settings: Settings, req: ChatRequest & { onRetry?: (m
   }
 }
 
-/** One streaming request. Throws ChatError (retryable or not) with the partial content streamed so far. */
 /**
  * The messages as sent: an assistant message's reasoning goes back to the server (as reasoning_content
  * for llama.cpp/older vLLM and reasoning for vLLM ≥ 0.20) only where the profile preserves thinking:
@@ -157,19 +169,21 @@ export function splitThinking(content: string): { text: string; thinking: string
   return { text: content.slice(end + "</think>".length).trim(), thinking };
 }
 
+/** One streaming request. Throws ChatError (retryable or not) with the partial content streamed so far. */
 async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig): Promise<ChatResult> {
   const r = resolveRequest(settings, req.role);
+  const plain = plainServers.has(r.baseUrl);
   const body: Record<string, unknown> = {
     ...r.extraBody,
     model: r.model,
-    messages: wireMessages(req.messages, r.preserve),
+    messages: wireMessages(req.messages, plain ? "off" : r.preserve),
     // OpenAI rejects an empty tools array
     ...(req.tools.length && { tools: req.tools.map(toolSpec) }),
     stream: true,
     stream_options: { include_usage: true },
   };
-  for (const [k, v] of Object.entries(r.sampling)) if (v !== undefined) body[k] = v;
-  if (r.chatTemplateKwargs) body.chat_template_kwargs = { ...(r.extraBody?.chat_template_kwargs as object), ...r.chatTemplateKwargs };
+  for (const [k, v] of Object.entries(r.sampling)) if (v !== undefined && !(plain && (k === "top_k" || k === "min_p" || k === "repetition_penalty"))) body[k] = v;
+  if (r.chatTemplateKwargs && !plain) body.chat_template_kwargs = { ...(r.extraBody?.chat_template_kwargs as object), ...r.chatTemplateKwargs };
   if (req.maxTokens ?? r.maxTokens) body.max_tokens = req.maxTokens ?? r.maxTokens;
 
   // Our own watchdog: the first byte may take long (prompt processing), but a stream must not stall.

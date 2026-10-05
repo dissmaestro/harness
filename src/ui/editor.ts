@@ -15,12 +15,20 @@ export type Key = { name?: string; ctrl?: boolean; meta?: boolean; shift?: boole
 const CONT = "  ";
 const TAB = "    ";
 
+/** Symbols below U+1F300 that terminals draw two columns wide (Unicode East Asian Width "W"): ✅ ❌ ⭐ ⚡ … */
+const WIDE_SYMBOLS = new Set([
+  0x231a, 0x231b, 0x23e9, 0x23ea, 0x23eb, 0x23ec, 0x23f0, 0x23f3, 0x25fd, 0x25fe, 0x2614, 0x2615, 0x267f, 0x2693, 0x26a1, 0x26aa,
+  0x26ab, 0x26bd, 0x26be, 0x26c4, 0x26c5, 0x26ce, 0x26d4, 0x26ea, 0x26f2, 0x26f3, 0x26f5, 0x26fa, 0x26fd, 0x2705, 0x270a, 0x270b,
+  0x2728, 0x274c, 0x274e, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797, 0x27b0, 0x27bf, 0x2b1b, 0x2b1c, 0x2b50, 0x2b55,
+]);
+
 /** Display width of one character (CJK and emoji take two columns). */
 export function charWidth(ch: string): number {
   if (ch === "\t") return TAB.length;
   const cp = ch.codePointAt(0)!;
   if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
-  if (cp >= 0x300 && cp <= 0x36f) return 0; // combining marks
+  if ((cp >= 0x300 && cp <= 0x36f) || cp === 0xfe0f || cp === 0x200d) return 0; // combining marks, emoji variation selector, ZWJ
+  if (WIDE_SYMBOLS.has(cp) || (cp >= 0x2648 && cp <= 0x2653)) return 2;
   if (
     (cp >= 0x1100 && cp <= 0x115f) ||
     (cp >= 0x2e80 && cp <= 0xa4cf) ||

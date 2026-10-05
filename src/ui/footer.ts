@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { strWidth } from "./editor.ts";
 import { truncateAnsi } from "./menu.ts";
 
 /**
@@ -22,7 +23,7 @@ export function paintBelow(out: NodeJS.WriteStream, rows: string[], col: number,
 export function columnAfter(s: string, col: number): number {
   const t = s.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
   const i = Math.max(t.lastIndexOf("\n"), t.lastIndexOf("\r"));
-  return i >= 0 ? [...t.slice(i + 1)].length : col + [...t].length;
+  return i >= 0 ? strWidth(t.slice(i + 1)) : col + strWidth(t);
 }
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

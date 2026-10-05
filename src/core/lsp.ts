@@ -89,6 +89,11 @@ class Client {
   private waiters = new Map<string, Array<() => void>>();
   private ready: Promise<void>;
   dead = false;
+  /** checks in a row that got no diagnostics in time: a server that never answers stops being asked */
+  private misses = 0;
+  get unresponsive() {
+    return this.misses >= 2;
+  }
 
   readonly name: string;
   readonly root: string;
@@ -205,7 +210,10 @@ class Client {
   async check(file: string, text: string, languageId: string, timeoutMs: number): Promise<Diagnostic[] | undefined> {
     const t0 = Date.now();
     const ok = await Promise.race([this.ready.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), timeoutMs))]);
-    if (!ok || this.dead) return undefined;
+    if (!ok || this.dead) {
+      this.misses++;
+      return undefined;
+    }
     const uri = pathToFileURL(file).href;
     const version = (this.versions.get(uri) ?? 0) + 1;
     this.versions.set(uri, version);
@@ -214,7 +222,11 @@ class Client {
     if (version === 1) this.notify("textDocument/didOpen", { textDocument: { uri, languageId, version, text } });
     else this.notify("textDocument/didChange", { textDocument: { uri, version }, contentChanges: [{ text }] });
     this.notify("textDocument/didSave", { textDocument: { uri }, text });
-    if (!(await published)) return this.diags.get(uri);
+    if (!(await published)) {
+      this.misses++;
+      return this.diags.get(uri);
+    }
+    this.misses = 0;
     // some servers publish twice (syntax first, then semantic): give a later one a moment
     await this.nextPublish(uri, 300);
     return this.diags.get(uri) ?? [];
@@ -266,6 +278,7 @@ export class LspManager {
       const root = findRoot(file, top, spec.roots);
       const key = `${spec.command}\0${root}`;
       let client = this.clients.get(key);
+      if (client?.unresponsive) continue; // e.g. still indexing a huge project: don't make every edit wait
       if (!client || client.dead) {
         if (this.clients.size >= 6) return undefined; // worktrees could otherwise start a server each
         client = new Client(exe, spec.args ?? [], root);

@@ -107,3 +107,12 @@ test("layout: wrapping, continuation lines, wide characters", () => {
   assert.equal(strWidth("日本"), 4);
   assert.equal(strWidth("привет"), 6);
 });
+
+test("widths: emoji below U+1F300 and after it are two columns; the footer's column follows them", async () => {
+  const { columnAfter } = await import("../src/ui/footer.ts");
+  assert.equal(strWidth("✅ ok"), 5);
+  assert.equal(strWidth("🚀"), 2);
+  assert.equal(strWidth("❤️"), 1, "a narrow symbol with a variation selector stays narrow here");
+  assert.equal(columnAfter("Done ✅", 0), 7);
+  assert.equal(columnAfter("\x1b[32m日本\x1b[39m", 3), 7);
+});

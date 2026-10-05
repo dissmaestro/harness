@@ -109,3 +109,41 @@ test("a real language server (gopls) reports a type error", { skip: !gopls && "g
     d.stop();
   }
 });
+
+test("no false errors: JSONC (tsconfig with comments), JSX in .js, zsh scripts; strict JSON still checked", async () => {
+  const cwd = tempDir();
+  const d = new Diagnostics(cwd, { lsp: false });
+  const ts = join(cwd, "tsconfig.json");
+  const tsText = '{\n  // strict mode\n  "compilerOptions": { "strict": true, /* no emit */ "noEmit": true, },\n  "include": ["src/**/*.ts"],\n}\n';
+  writeFileSync(ts, tsText);
+  assert.equal(await d.afterEdit(ts, tsText, cwd), "");
+  const pkg = join(cwd, "package.json");
+  writeFileSync(pkg, '{ "name": "x", }\n');
+  assert.match(await d.afterEdit(pkg, '{ "name": "x", }\n', cwd), /package\.json now has 1 error/);
+  const jsx = join(cwd, "App.js");
+  writeFileSync(jsx, 'export default function App() {\n  return <div className="x">hi</div>;\n}\n');
+  assert.equal(await d.afterEdit(jsx, "", cwd), "");
+  const zsh = join(cwd, "setup.sh");
+  const zshText = "#!/bin/zsh\nfor f in *(.); do echo $f; done\n";
+  writeFileSync(zsh, zshText);
+  assert.doesNotMatch(await d.afterEdit(zsh, zshText, cwd), /error/);
+});
+
+test("a language server that never answers stops being waited for", async () => {
+  const cwd = tempDir();
+  const server = join(cwd, "silent-lsp");
+  writeFileSync(server, '#!/usr/bin/env node\nprocess.stdin.on("data", () => {});\nsetInterval(() => {}, 1000);\n');
+  chmodSync(server, 0o755);
+  const d = new Diagnostics(cwd, { servers: { ".foo": { command: server } }, timeoutMs: 400 });
+  try {
+    const f = join(cwd, "a.foo");
+    writeFileSync(f, "x");
+    await d.afterEdit(f, "1", cwd);
+    await d.afterEdit(f, "2", cwd);
+    const t0 = Date.now();
+    await d.afterEdit(f, "3", cwd);
+    assert.ok(Date.now() - t0 < 200, `third edit waited ${Date.now() - t0}ms`);
+  } finally {
+    d.stop();
+  }
+});

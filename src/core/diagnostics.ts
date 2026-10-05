@@ -13,6 +13,32 @@ export interface DiagnosticsConfig {
 
 const MAX_SHOWN = 10;
 
+/** JSON files that allow comments and trailing commas (tsconfig, VS Code settings, …). */
+const JSONC = /(^|\/)(tsconfig[^/]*|jsconfig[^/]*|devcontainer|\.eslintrc|\.babelrc|turbo|biome|deno|launch|settings|tasks|extensions)\.json$|\.jsonc$|\.json5$/i;
+
+/** Removes // and /* *\/ comments outside strings, and trailing commas, so JSON.parse can check the rest. */
+export function stripJsonc(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const comment = text.slice(i, end < 0 ? text.length : end + 2);
+      out += comment.replace(/[^\n]/g, " "); // keep line numbers
+      i = end < 0 ? text.length : end + 1;
+    } else out += ch;
+  }
+  return out.replace(/,(\s*[}\]])/g, " $1");
+}
+
 /** Syntax checks that need no language server: fast, and catch the broken edits local models make. */
 async function quickCheck(file: string, text: string, cwd: string): Promise<{ tool: string; diags: Diagnostic[] } | undefined> {
   const ext = file.slice(file.lastIndexOf(".")).toLowerCase();
@@ -23,12 +49,13 @@ async function quickCheck(file: string, text: string, cwd: string): Promise<{ to
     const out = `${r.stderr}\n${r.stdout}`;
     const m = parse.exec(out);
     const message = (/(?:SyntaxError|Error|error):?\s*(.+)/.exec(out)?.[1] ?? out.trim().split("\n").at(-1) ?? "syntax error").trim();
-    return { tool, diags: [{ line: Number(m?.[1] ?? 1), col: Number(m?.[2] ?? 1), severity: "error" as const, message }] };
+    return { tool, raw: out, diags: [{ line: Number(m?.[1] ?? 1), col: Number(m?.[2] ?? 1), severity: "error" as const, message }] };
   };
   switch (ext) {
     case ".json":
+    case ".jsonc":
       try {
-        JSON.parse(text);
+        JSON.parse(JSONC.test(file) ? stripJsonc(text) : text);
         return { tool: "JSON.parse", diags: [] };
       } catch (e) {
         const pos = Number(/position (\d+)/.exec(String((e as Error).message))?.[1] ?? 0);
@@ -37,13 +64,24 @@ async function quickCheck(file: string, text: string, cwd: string): Promise<{ to
       }
     case ".js":
     case ".mjs":
-    case ".cjs":
-      return run("node --check", process.execPath, ["--check", file], /:(\d+)\n/);
+    case ".cjs": {
+      const r = await run("node --check", process.execPath, ["--check", file], /:(\d+)\n/);
+      if (!r || !r.diags.length) return r;
+      // only a SyntaxError in this file counts (not e.g. a broken package.json next to it); JSX or Flow in a .js
+      // file is not plain JavaScript but not an error either: node just can't tell
+      if (!/SyntaxError/.test(r.raw ?? "") || r.diags.some((d) => /Unexpected token '[<:]'|Unexpected identifier 'type'/.test(d.message))) return undefined;
+      return r;
+    }
     case ".py":
       return run("python3 ast.parse", "python3", ["-c", "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read(), sys.argv[1])", file], /line (\d+)/);
     case ".sh":
-    case ".bash":
+    case ".bash": {
+      // the shebang decides the shell: a zsh script is checked with zsh, other shells are not checked
+      const shell = /^#!.*\b(bash|sh|dash|zsh|ksh|fish)\b/.exec(text.split("\n", 1)[0])?.[1] ?? "bash";
+      if (shell === "zsh") return run("zsh -n", "zsh", ["-n", file], /:(\d+):/);
+      if (shell === "ksh" || shell === "fish") return undefined;
       return run("bash -n", "bash", ["-n", file], /line (\d+)/);
+    }
     case ".go":
       return run("gofmt -e", "gofmt", ["-e", "-l", file], /:(\d+):(\d+):/);
   }
