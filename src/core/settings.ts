@@ -52,6 +52,8 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** snapshot the project in a shadow git repo before every changing tool call (/restore) */
+  checkpoints?: boolean;
   /** lint/test commands run after a turn that changed files; failures go back to the model */
   verify?: VerifyConfig;
 }

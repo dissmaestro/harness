@@ -10,6 +10,7 @@ import type { Message, Session, Tool, ToolCall, ToolContext } from "../types.ts"
 import { oneLine, resolvePath, saveFullOutput, truncateMiddle } from "../util.ts";
 import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
+import { type Checkpoint, Checkpoints } from "./checkpoints.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
@@ -121,6 +122,11 @@ export class Agent {
   parent: Agent | undefined;
   /** a command that may change files ran during this turn (for automatic verification) */
   private execRan = false;
+  /** shadow-git snapshots before changing tool calls (the main agent's; subagents in the same folder share it) */
+  private checkpointStore: Checkpoints | undefined;
+  private checkpointWarned = false;
+  /** the current turn of the main agent: its message and the history length before it */
+  private turn = { prompt: "", history: 0 };
   /** what every agent of this session is doing (shared with subagents) */
   board: ActivityBoard;
   activity: Activity;
@@ -210,6 +216,55 @@ export class Agent {
       else if (was === "plan") this.pendingReminders.push(PLAN_MODE_OFF(MODES[mode].label));
     }
     this.onModeChange?.(mode);
+  }
+
+  // ---------- checkpoints ----------
+
+  /** The checkpoint store of this folder (none for a subagent working in its own worktree). */
+  get checkpoints(): Checkpoints | undefined {
+    const root = this.parent ?? this;
+    if (root !== this) return root.cwd === this.cwd ? root.checkpoints : undefined;
+    if (this.settings.checkpoints === false) return undefined;
+    this.checkpointStore ??= new Checkpoints(this.cwd, this.home);
+    return this.checkpointStore;
+  }
+
+  private async checkpoint(before: string, ui: AgentUI) {
+    const store = this.checkpoints;
+    if (!store) return;
+    const root = this.parent ?? this;
+    await store.snapshot({ turn: root.turn.prompt, history: root.turn.history, before });
+    if (store.disabled && !root.checkpointWarned) {
+      root.checkpointWarned = true;
+      ui.onInfo(store.disabled);
+    }
+  }
+
+  /**
+   * Goes back to a checkpoint: "files" puts the files back, "chat" drops the conversation from that
+   * checkpoint's turn on, "both" does both. Returns the turn's message (to edit and send again).
+   */
+  async restore(n: number, what: "files" | "chat" | "both"): Promise<{ cp: Checkpoint; restored: string[]; removed: string[] }> {
+    const store = this.checkpoints;
+    const cp = store?.list.find((c) => c.n === n);
+    if (!store || !cp) throw new Error(`No checkpoint #${n}. /restore lists them.`);
+    let restored: string[] = [];
+    let removed: string[] = [];
+    if (what !== "chat") ({ restored, removed } = await store.restoreFiles(cp, this.turn.prompt, this.messages.length));
+    if (what !== "files") {
+      this.replaceHistory(sanitizeHistory(this.messages.slice(0, Math.max(1, cp.history))));
+      this.readFiles.clear();
+      this.lastUsage = undefined;
+      this.usageAtMessages = 0;
+    }
+    const paths = [...restored, ...removed];
+    if (paths.length) {
+      const message =
+        `The user restored the project files to how they were before "${cp.before}" (checkpoint #${cp.n}). ` +
+        `Changed back: ${paths.slice(0, 30).join(", ")}${paths.length > 30 ? ", …" : ""}. Re-read files before editing them.`;
+      this.notifyFilesChanged(paths.map((p) => join(this.cwd, p)), message);
+    }
+    return { cp, restored, removed };
   }
 
   // ---------- verification ----------
@@ -310,7 +365,10 @@ export class Agent {
       ui.onInfo(`Prompt blocked by hook: ${hook.feedback}`);
       return "";
     }
-    if (!this.subagent) this.changes.beginTurn(userText);
+    if (!this.subagent) {
+      this.changes.beginTurn(userText);
+      this.turn = { prompt: userText, history: this.messages.length };
+    }
     const extras: string[] = [];
     if (hook.context) extras.push(hook.context);
     // The catalog is appended (never put in the system prompt) and only re-sent when it changes.
@@ -572,7 +630,9 @@ export class Agent {
       ui.onToolEnd(name, permission, true);
       return permission;
     }
-    if (tool.kind === "exec" && !(name === "Bash" && isReadOnlyCommand(String(args.command ?? "")))) (this.parent ?? this).execRan = true;
+    const changing = tool.kind === "edit" || (tool.kind === "exec" && !(name === "Bash" && isReadOnlyCommand(String(args.command ?? ""))));
+    if (changing && tool.kind === "exec") (this.parent ?? this).execRan = true;
+    if (changing) await this.checkpoint(`${name}(${this.board.toolSummary(name, args)})`, ui);
     const pre = await this.hook(ui, "PreToolUse", { tool_name: name, tool_input: args }, name, signal);
     if (pre.blocked) {
       const msg = `Blocked by PreToolUse hook: ${pre.feedback}`;

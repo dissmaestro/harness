@@ -44,6 +44,7 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Changes", name: "view", args: "<path>[:a-b]", description: "show a file (or lines a-b) with line numbers" },
   { group: "Changes", name: "undo", description: "restore the files the last turn changed" },
   { group: "Changes", name: "revert", args: "[path]", description: "restore files to how they were at session start" },
+  { group: "Changes", name: "restore", args: "[n] [files|chat|both]", description: "go back to a checkpoint (taken before every change, Bash included)" },
   { group: "Changes", name: "last", description: "full output of the last tool" },
   { group: "Changes", name: "verify", args: "[fix]", description: "run the lint/test commands now; /verify fix hands a failure to the agent" },
 ];
@@ -692,6 +693,49 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return box(rendered, title, paint);
   };
 
+  /** text to put in the input line at the next prompt (the message of a turn that was rewound) */
+  let prefill = "";
+  const restoreCmd = async (arg: string) => {
+    const store = agent.checkpoints;
+    if (!store) return line(c.dim('  Checkpoints are off ("checkpoints": false).'));
+    if (!store.list.length) return line(c.dim(store.disabled ? `  ${store.disabled}` : "  No checkpoints yet: one is taken before every change the agent makes."));
+    const [nArg, whatArg] = arg.split(/\s+/);
+    if (!nArg) {
+      for (const cp of store.list.slice(-15)) {
+        const time = cp.at.toLocaleTimeString();
+        line(`  ${c.cyan(`#${cp.n}`.padStart(4))}  ${c.dim(time)}  before ${c.bold(oneLine(cp.before, 50))}  ${c.dim(`turn: “${oneLine(cp.turn, 40)}”`)}`);
+      }
+      line(c.dim("  /restore <n> [files|chat|both]: files go back to how they were right before that step; chat drops the conversation from that turn on."));
+      return;
+    }
+    const n = Number(nArg.replace(/^#/, ""));
+    const cp = store.list.find((x) => x.n === n);
+    if (!cp) return line(c.red(`  No checkpoint #${nArg}.`));
+    const changed = await store.changedSince(cp);
+    if (changed.length) {
+      line(`  Files that go back to checkpoint #${n}:`);
+      for (const [st, p] of changed.slice(0, 20)) line(`    ${st === "A" ? c.red("delete ") : st === "D" ? c.green("restore") : c.yellow("revert ")} ${p}`);
+      if (changed.length > 20) line(c.dim(`    … ${changed.length - 20} more`));
+    } else line(c.dim(`  The files are already as they were at #${n}.`));
+    let what = whatArg as "files" | "chat" | "both" | undefined;
+    if (!what) {
+      const a = ((await answer(c.yellow("  Restore [f]iles, [c]onversation, [b]oth, or [N]o? › "))) ?? "").trim().toLowerCase();
+      what = a.startsWith("f") ? "files" : a.startsWith("c") ? "chat" : a.startsWith("b") ? "both" : undefined;
+      if (!what) return line(c.dim("  Nothing changed."));
+    }
+    if (!["files", "chat", "both"].includes(what)) return line(c.red("  Use files, chat or both."));
+    try {
+      const r = await agent.restore(n, what);
+      if (what !== "chat") line(c.green(`  Files restored: ${r.restored.length} put back, ${r.removed.length} removed.`) + c.dim(" /restore again can undo this."));
+      if (what !== "files") {
+        line(c.green(`  Conversation rewound to before “${oneLine(cp.turn, 60)}”.`) + c.dim(" The message is in the input line: edit it and press Enter."));
+        prefill = cp.turn;
+      }
+    } catch (e) {
+      line(c.red(`  ✗ ${(e as Error).message}`));
+    }
+  };
+
   const verify = async (fix: boolean) => {
     const cfg = agent.settings.verify;
     if (!cfg?.test && !cfg?.lint) {
@@ -777,6 +821,12 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   // ----- main loop -----
   if (initialPrompt?.trim()) queue.unshift(initialPrompt);
   while (true) {
+    if (prefill) {
+      const r = rl as unknown as { line: string; cursor: number };
+      r.line = prefill;
+      r.cursor = prefill.length;
+      prefill = "";
+    }
     let rawInput = await nextLine(promptFor(agent.mode));
     if (rawInput === null) break;
     // a trailing backslash continues the input on the next line
@@ -817,6 +867,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         break;
       case "verify":
         await verify(args.trim() === "fix");
+        break;
+      case "restore":
+        await restoreCmd(args.trim());
         break;
       case "clear":
         agent.reset();
