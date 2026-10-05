@@ -17,6 +17,7 @@ const USAGE = `Usage: agent [options] [prompt]
                          piped stdin is appended: cat log | agent -p "explain"
   -m, --model <name>     model name sent to the server
       --base-url <url>   OpenAI-compatible endpoint (default http://localhost:8080/v1)
+      --api-key <key>    API key sent as "Authorization: Bearer <key>" (server --api-key)
       --mode <mode>      start in: ask | acceptEdits | plan | auto | yolo
       --plan             same as --mode plan (read-only research, then a plan)
       --auto             same as --mode auto (everything except dangerous actions)
@@ -69,6 +70,7 @@ async function main() {
       print: { type: "boolean", short: "p" },
       model: { type: "string", short: "m" },
       "base-url": { type: "string" },
+      "api-key": { type: "string" },
       mode: { type: "string" },
       plan: { type: "boolean" },
       auto: { type: "boolean" },
@@ -123,6 +125,7 @@ async function main() {
   const settings = loadSettings(cwd);
   if (values.model) settings.model = values.model;
   if (values["base-url"]) settings.baseUrl = values["base-url"];
+  if (values["api-key"]) settings.apiKey = values["api-key"];
   if (values["accept-edits"]) settings.permissionMode = "acceptEdits";
   if (values.plan) settings.permissionMode = "plan";
   if (values.auto) settings.permissionMode = "auto";

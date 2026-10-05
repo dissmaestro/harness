@@ -85,6 +85,11 @@ export function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
 }
 
+/** "ctx 3.2k/66k (5%)" */
+export function contextLabel(used: number, win: number): string {
+  return `ctx ${formatTokens(used)}/${formatTokens(win)} (${Math.round((used / win) * 100)}%)`;
+}
+
 /** A rounded box around lines (ANSI-aware width). */
 export function box(lines: string[], title = "", paint: (s: string) => string = c.gray): string {
   const width = Math.max(stripAnsi(title).length + 4, ...lines.map((l) => stripAnsi(l).length)) + 2;

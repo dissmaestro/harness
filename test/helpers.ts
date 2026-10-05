@@ -35,6 +35,7 @@ export type Reply = object[] | { status: number; body: object };
 /** Fake OpenAI-compatible server: replies with scripted SSE streams and records each request body. */
 export async function fakeServer(script: Reply[], nCtx = 100_000) {
   const requests: any[] = [];
+  const headers: IncomingMessage["headers"][] = [];
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "GET") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -44,6 +45,7 @@ export async function fakeServer(script: Reply[], nCtx = 100_000) {
     let body = "";
     for await (const chunk of req) body += chunk;
     requests.push(JSON.parse(body));
+    headers.push(req.headers);
     const reply = script[requests.length - 1] ?? [{ choices: [{ delta: { content: "(script exhausted)" } }] }];
     if (!Array.isArray(reply)) {
       res.writeHead(reply.status, { "content-type": "application/json" });
@@ -56,7 +58,7 @@ export async function fakeServer(script: Reply[], nCtx = 100_000) {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const { port } = server.address() as AddressInfo;
-  return { url: `http://127.0.0.1:${port}/v1`, requests, close: () => server.close() };
+  return { url: `http://127.0.0.1:${port}/v1`, requests, headers, close: () => server.close() };
 }
 
 export const text = (content: string): Reply => [{ choices: [{ delta: { content } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }];

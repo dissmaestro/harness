@@ -1,6 +1,6 @@
 import type { Agent, AgentUI } from "../core/loop.ts";
 import { diffStat } from "./diff.ts";
-import { argSummary, c, resultSummary } from "./render.ts";
+import { argSummary, c, contextLabel, resultSummary } from "./render.ts";
 
 /** agent -p "prompt": answer on stdout, tool activity on stderr. Actions that would need a question are denied. */
 export async function runHeadless(agent: Agent, prompt: string, warnings: string[]): Promise<number> {
@@ -35,6 +35,8 @@ export async function runHeadless(agent: Agent, prompt: string, warnings: string
   try {
     await agent.send(prompt, makeUI(""), ac.signal);
     process.stdout.write("\n");
+    // on stderr, so `agent -p ... > answer.txt` still gets only the answer
+    err(c.dim(contextLabel(agent.contextUsed(), await agent.contextWindow())));
     return 0;
   } catch (e) {
     err(c.red(`Error: ${(e as Error).message}`));

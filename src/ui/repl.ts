@@ -1,7 +1,8 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { createInterface } from "node:readline";
+import { createInterface, emitKeypressEvents } from "node:readline";
+import { PassThrough } from "node:stream";
 import { readText, type ChangeTracker } from "../core/changes.ts";
 import type { Agent, AgentUI, Approval, PlanDecision } from "../core/loop.ts";
 import { MODES, MODE_CYCLE, nextMode, parseMode, type Mode } from "../core/modes.ts";
@@ -11,37 +12,69 @@ import type { Tool } from "../types.ts";
 import { oneLine } from "../util.ts";
 import { diffStat, renderDiff } from "./diff.ts";
 import { langFromPath, lineHighlighter } from "./highlight.ts";
+import { type CommandInfo, SHORTCUTS, complete, expandMentions, projectFiles } from "./complete.ts";
 import { MarkdownStream } from "./markdown.ts";
+import { InputMenu } from "./menu.ts";
 import { page } from "./pager.ts";
-import { MODE_STYLE, argSummary, box, c, diffLines, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
+import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
 import { Spinner } from "./spinner.ts";
 
-const HELP = `${c.bold("Modes")} ${c.dim("(shift+tab cycles ask → accept edits → plan → auto)")}
-  ask           reads freely, asks before edits and commands
-  accept edits  edits files in the project without asking, commands still ask
-  plan          read-only research, then a plan for you to approve
-  auto          runs everything except dangerous commands and edits outside the project
-  yolo          never asks (only via /mode yolo or --yolo)
+/** Built-in commands: the /help text and the / menu. */
+export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })[] = [
+  { group: "Commands", name: "help", description: "commands and keyboard shortcuts" },
+  { group: "Commands", name: "keys", description: "keyboard shortcuts (or type ?)" },
+  { group: "Commands", name: "mode", args: "[name]", description: "show or switch mode" },
+  { group: "Commands", name: "plan", args: "[task]", description: "plan mode: research read-only, then a plan" },
+  { group: "Commands", name: "auto", args: "[task]", description: "auto mode: everything except dangerous actions" },
+  { group: "Commands", name: "compact", args: "[focus]", description: "summarize the conversation to free context" },
+  { group: "Commands", name: "context", description: "context usage" },
+  { group: "Commands", name: "clear", description: "start a new conversation" },
+  { group: "Commands", name: "skills", description: "available skills" },
+  { group: "Commands", name: "agents", description: "available subagents" },
+  { group: "Commands", name: "tools", description: "core and deferred tools" },
+  { group: "Commands", name: "commands", description: "custom slash commands" },
+  { group: "Commands", name: "thinking", description: "show or hide the model's reasoning" },
+  { group: "Commands", name: "exit", description: "quit (or ctrl+d)" },
+  { group: "Changes", name: "files", description: "files changed this session" },
+  { group: "Changes", name: "diff", args: "[path]", description: "diff against the session start" },
+  { group: "Changes", name: "view", args: "<path>[:a-b]", description: "show a file (or lines a-b) with line numbers" },
+  { group: "Changes", name: "undo", description: "restore the files the last turn changed" },
+  { group: "Changes", name: "revert", args: "[path]", description: "restore files to how they were at session start" },
+  { group: "Changes", name: "last", description: "full output of the last tool" },
+];
 
-${c.bold("Commands")}
-  /mode [name]          show or switch mode       /plan  /auto  shortcuts
-  /compact [focus]      summarize the conversation to free context
-  /context              context usage
-  /clear                start a new conversation
-  /skills /agents /tools /commands   what is available
-  /thinking             show or hide the model's reasoning
-  /exit                 quit (or ctrl+d)
-  /<skill> [args]       run a skill        /<command> [args]  run a command
+const key = (k: string) => k.split(" ").map((x) => c.cyan(x)).join(c.dim(" "));
 
-${c.bold("Changes")}
-  /files                files changed this session
-  /diff [path]          diff against the session start
-  /view <path>[:a-b]    show a file (or lines a-b) with line numbers
-  /undo                 restore the files the last turn changed
-  /revert [path]        restore files to how they were at session start
-  /last                 full output of the last tool
-${c.dim("ctrl+c interrupts the current answer or clears the line; twice at an empty prompt quits.")}
-${c.dim("End a line with \\ to continue on the next one; pasted text is sent as one message.")}`;
+export function shortcutsText(): string {
+  const w = Math.max(...SHORTCUTS.map(([k]) => k.length));
+  return SHORTCUTS.map(([k, what]) => `  ${key(k)}${" ".repeat(w - k.length)}   ${what}`).join("\n");
+}
+
+function helpText(): string {
+  const section = (title: string, note = "") => c.bold(title) + (note ? " " + c.dim(note) : "");
+  const cmdRows = (group: string) => {
+    const list = BUILTIN_COMMANDS.filter((x) => x.group === group);
+    const w = Math.max(...list.map((x) => x.name.length + (x.args ? x.args.length + 1 : 0))) + 1;
+    return list.map((x) => `  ${c.cyan("/" + x.name)}${x.args ? " " + c.dim(x.args) : ""}${" ".repeat(w - x.name.length - (x.args ? x.args.length + 1 : 0))}  ${x.description}`).join("\n");
+  };
+  const modes = MODE_CYCLE.concat("yolo")
+    .map((m) => `  ${MODE_STYLE[m](MODES[m].label.padEnd(13))} ${MODES[m].description}${m === "yolo" ? c.dim(" (only /mode yolo or --yolo)") : ""}`)
+    .join("\n");
+  return [
+    section("Modes", "(shift+tab cycles ask → accept edits → plan → auto)"),
+    modes,
+    "",
+    section("Commands", "(type / for a menu)"),
+    cmdRows("Commands"),
+    `  ${c.cyan("/<skill>")} ${c.dim("[args]")}       run a skill · ${c.cyan("/<command>")} ${c.dim("[args]")} run a custom command`,
+    "",
+    section("Changes"),
+    cmdRows("Changes"),
+    "",
+    section("Keys"),
+    shortcutsText(),
+  ].join("\n");
+}
 
 /** Tools whose results are shown as a diff of the file they wrote. */
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -106,8 +139,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   const width = () => Math.max(40, Math.min(out.columns || 100, 120));
   const historyFile = join(agent.home ?? homedir(), ".agent", "history");
   const history = loadHistory(historyFile);
+  // In a terminal, keys go through the completion menu first and then on to readline via `input`.
+  const input = tty ? Object.assign(new PassThrough(), { isTTY: true, setRawMode: (on: boolean) => process.stdin.setRawMode(on) }) : process.stdin;
   const rl = createInterface({
-    input: process.stdin,
+    input,
     output: out,
     historySize: 1000,
     history: [...history].reverse(),
@@ -115,6 +150,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   });
   const rlHistory = () => (rl as unknown as { history?: string[] }).history ?? [];
   const spinner = new Spinner(out);
+  let ctxWindow: number | undefined;
+  let menu: InputMenu | undefined;
+  spinner.detail = () => (ctxWindow ? contextLabel(agent.contextUsed(), ctxWindow) : "");
   let atLineStart = true;
   let running: AbortController | undefined;
   let showThinking = false;
@@ -122,6 +160,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
 
   const raw = (s: string) => {
     if (!s) return;
+    menu?.clear();
     spinner.stop();
     out.write(s);
     atLineStart = s.endsWith("\n");
@@ -198,7 +237,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     }
     rl.prompt();
     if (closed) return Promise.resolve(null);
-    return new Promise((r) => (waiter = r));
+    const p = new Promise<string | null>((r) => (waiter = r));
+    menu?.update(true);
+    return p;
   };
   /** an answer to a question: fresh input only, and kept out of the up-arrow history */
   const answer = async (prompt: string): Promise<string | null> => {
@@ -235,13 +276,49 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       }
       rl.setPrompt(promptFor(m));
       rl.prompt(true);
+      menu?.update();
     });
   };
-  if (process.stdin.isTTY) {
-    process.stdin.on("keypress", (_s, key) => {
-      if (key?.name === "paste-start") pasting = true;
-      else if (key?.name === "paste-end") pasting = false;
-      else if (key?.name === "tab" && key.shift && !pasting) agent.setMode(nextMode(agent.mode));
+  // ----- completion menu: / commands, @ paths, ? shortcuts -----
+  const files = projectFiles(agent.cwd);
+  const menuCommands = (): CommandInfo[] => [
+    ...BUILTIN_COMMANDS,
+    ...[...reg.skills.values()].map((x) => ({ name: x.name, args: "[args]", description: "skill · " + oneLine(x.description, 70) })),
+    ...[...reg.commands.values()].filter((x) => !reg.skills.has(x.name)).map((x) => ({ name: x.name, args: "[args]", description: oneLine(x.description, 70) })),
+  ];
+  const keyRows = () => {
+    const w = Math.max(...SHORTCUTS.map(([k]) => k.length));
+    return SHORTCUTS.map(([k, what]) => `   ${key(k)}${" ".repeat(w - k.length)}   ${c.dim(what)}`);
+  };
+  menu = new InputMenu({
+    rl,
+    out,
+    active: () => !!waiter && !waiterFresh && !running && !pasting,
+    complete: (l, cur) => complete(l, cur, menuCommands(), agent.cwd, files),
+    panel: (l) => (l === "?" ? keyRows() : l === "" ? [c.dim("   / commands · @ files · ? shortcuts · shift+tab mode")] : undefined),
+  });
+  if (tty) {
+    // a short escape timeout so a lone esc closes the menu right away
+    emitKeypressEvents(process.stdin, { escapeCodeTimeout: 50 } as never);
+    process.stdin.setRawMode(true);
+    process.stdin.on("keypress", (s, k) => {
+      if (k?.name === "paste-start") pasting = true;
+      else if (k?.name === "paste-end") pasting = false;
+      else if (k?.name === "tab" && k.shift && !pasting) agent.setMode(nextMode(agent.mode));
+      const forward = (seq: string) => input.write(seq);
+      if (!pasting && menu!.key(k, forward)) return;
+      forward(k?.sequence ?? s);
+      setImmediate(() => menu!.update());
+    });
+    rl.on("close", () => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+    });
+  } else if (process.stdin.isTTY) {
+    process.stdin.on("keypress", (_s, k) => {
+      if (k?.name === "paste-start") pasting = true;
+      else if (k?.name === "paste-end") pasting = false;
+      else if (k?.name === "tab" && k.shift && !pasting) agent.setMode(nextMode(agent.mode));
     });
   }
   if (tty) {
@@ -406,7 +483,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   const ui = makeUI(0);
 
   const status = async () => {
-    const win = await agent.contextWindow();
+    const win = (ctxWindow = await agent.contextWindow());
     const used = agent.contextUsed();
     const pct = Math.round((used / win) * 100);
     const paintPct = pct >= 80 ? c.red : pct >= 60 ? c.yellow : c.gray;
@@ -529,7 +606,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
 
   // ----- banner -----
   const reg = agent.registry;
-  const win = await agent.contextWindow();
+  const win = (ctxWindow = await agent.contextWindow());
   const host = agent.settings.baseUrl.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "");
   line(
     box(
@@ -537,7 +614,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         c.bold("agent") + c.dim(" — local coding agent"),
         `${c.cyan(agent.settings.model)} ${c.dim("@")} ${host} ${c.dim("·")} ctx ${formatTokens(win)}`,
         c.dim(`${reg.core.size} tools · ${reg.skills.size} skills · ${reg.agents.size} subagents · ${reg.deferred.size} deferred · ${reg.commands.size} commands`),
-        c.dim("shift+tab: mode · /help · ctrl+c: interrupt"),
+        `${key("/")} ${c.dim("commands ·")} ${key("@")} ${c.dim("files ·")} ${key("?")} ${c.dim("shortcuts ·")} ${key("shift+tab")} ${c.dim("mode")}`,
       ],
       "",
       c.magenta,
@@ -561,9 +638,15 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     const input = (rawInput.includes("\n") ? rawInput : rawInput.replace(/\t/g, "")).trim();
     if (!input) continue;
     remember(input);
+    if (input === "?") {
+      line(shortcutsText());
+      continue;
+    }
     const [, cmd, args] = input.slice(1).match(/^(\S*)\s*([\s\S]*)$/)!;
     if (!input.startsWith("/") || (isPathLike(input) && !reg.commands.has(cmd) && !reg.skills.has(cmd))) {
-      await ask(input);
+      const { text, attached } = expandMentions(input, agent.cwd);
+      for (const a of attached) line(c.gray("  ⎿ ") + c.dim(`@${a.path} (${a.summary})`));
+      await ask(text);
       continue;
     }
 
@@ -573,7 +656,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         rl.close();
         return;
       case "help":
-        line(HELP);
+        line(helpText());
+        break;
+      case "keys":
+        line(shortcutsText());
         break;
       case "clear":
         agent.reset();

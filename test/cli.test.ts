@@ -57,3 +57,16 @@ test("cli: -p joins positional words and appends piped stdin", async () => {
     srv.close();
   }
 });
+
+test("cli: --api-key is sent as a bearer token; -p reports context usage on stderr", async () => {
+  const srv = await fakeServer([text("ok")]);
+  try {
+    const r = await run(["-p", "hi", "--base-url", srv.url, "--api-key", "sk-test"], undefined, { AGENT_API_KEY: "" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(srv.headers[0].authorization, "Bearer sk-test");
+    assert.doesNotMatch(r.stdout, /ctx/);
+    assert.match(r.stderr, /ctx [\d.]+k?\/100k \(\d+%\)/);
+  } finally {
+    srv.close();
+  }
+});
