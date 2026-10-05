@@ -1,5 +1,6 @@
 import type { Interface } from "node:readline";
 import type { Completion, Item } from "./complete.ts";
+import { paintBelow } from "./footer.ts";
 import { c, stripAnsi } from "./render.ts";
 
 const VISIBLE = 8;
@@ -174,16 +175,9 @@ export class InputMenu {
   /** Draw rows under the input line and put the cursor back where readline left it. */
   private paint(rows: string[]) {
     if (!rows.length && !this.shown) return;
-    const out = this.o.out;
-    const cols = out.columns || 80;
+    const cols = this.o.out.columns || 80;
     const pos = this.o.rl.getCursorPos();
     const endRow = Math.floor((stripAnsi(this.o.rl.getPrompt()).length + this.r.line.length) / cols);
-    const down = Math.max(0, endRow - pos.rows);
-    let s = down ? `\x1b[${down}B` : "";
-    if (rows.length) s += "\r\n\x1b[J" + rows.join("\r\n") + `\x1b[${rows.length + down}A`;
-    else s += `\x1b[1B\r\x1b[J\x1b[${down + 1}A`;
-    s += "\r" + (pos.cols ? `\x1b[${pos.cols}C` : "");
-    out.write(s);
-    this.shown = rows.length;
+    this.shown = paintBelow(this.o.out, rows, pos.cols, this.shown, Math.max(0, endRow - pos.rows));
   }
 }

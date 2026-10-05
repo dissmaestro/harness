@@ -15,10 +15,11 @@ import { langFromPath, lineHighlighter } from "./highlight.ts";
 import { type CommandInfo, SHORTCUTS, complete, expandMentions, projectFiles } from "./complete.ts";
 import { MarkdownStream } from "./markdown.ts";
 import { InputMenu } from "./menu.ts";
-import { renderStatus } from "./status.ts";
+import { Footer, MutableOutput, columnAfter } from "./footer.ts";
+import { activitySummary, renderStatus } from "./status.ts";
+import { formatDuration } from "../core/activity.ts";
 import { page } from "./pager.ts";
 import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
-import { Spinner } from "./spinner.ts";
 
 /** Built-in commands: the /help text and the / menu. */
 export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })[] = [
@@ -143,29 +144,59 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   const history = loadHistory(historyFile);
   // In a terminal, keys go through the completion menu first and then on to readline via `input`.
   const input = tty ? Object.assign(new PassThrough(), { isTTY: true, setRawMode: (on: boolean) => process.stdin.setRawMode(on) }) : process.stdin;
+  // While agents work, readline's own echo is muted and the footer draws the typed line instead.
+  let muted = () => false;
   const rl = createInterface({
     input,
-    output: out,
+    output: tty ? (new MutableOutput(out, () => muted()) as unknown as NodeJS.WritableStream) : out,
     historySize: 1000,
     history: [...history].reverse(),
     terminal: !!out.isTTY,
   });
   const rlHistory = () => (rl as unknown as { history?: string[] }).history ?? [];
-  const spinner = new Spinner(out);
   let ctxWindow: number | undefined;
   let menu: InputMenu | undefined;
-  spinner.detail = () => (ctxWindow ? contextLabel(agent.contextUsed(), ctxWindow) : "");
   let atLineStart = true;
   let running: AbortController | undefined;
+  let runStarted = 0;
   let showThinking = false;
   let thinkingShown = false;
+  /** column of the cursor in the output, so the footer can be drawn under a half-written line */
+  let outCol = 0;
+
+  /** "› typed text" with a block cursor, scrolled so the cursor stays visible */
+  const inputRow = () => {
+    const r = rl as unknown as { line: string; cursor: number };
+    if (!r.line) return c.green("› ") + c.inverse(" ") + c.dim(" ask what's going on · >note to the agent · >#2 note to subagent #2 · /status");
+    const room = Math.max(10, (out.columns || 80) - 4);
+    const start = Math.max(0, r.cursor - room + 1);
+    const text = r.line.slice(start, start + room);
+    const cur = r.cursor - start;
+    return c.green("› ") + text.slice(0, cur) + c.inverse(text[cur] ?? " ") + text.slice(cur + 1);
+  };
+  const footer = new Footer(
+    out,
+    (frame) => {
+      if (!running || waiter) return [];
+      const ctx = ctxWindow ? ` · ${contextLabel(agent.contextUsed(), ctxWindow)}` : "";
+      const what = activitySummary(agent.board) || "thinking";
+      return [`${c.magenta(frame)} ${c.dim(`${what} · ${formatDuration(Date.now() - runStarted)}${ctx} · ctrl+c to interrupt`)}`, inputRow()];
+    },
+    () => outCol,
+  );
+
+  muted = () => !!running && !waiter;
+  /** side questions being answered while the agent works */
+  const asides = new Set<AbortController>();
 
   const raw = (s: string) => {
     if (!s) return;
     menu?.clear();
-    spinner.stop();
+    footer.clear();
     out.write(s);
+    outCol = columnAfter(s, outCol);
     atLineStart = s.endsWith("\n");
+    footer.draw();
   };
   const md = new MarkdownStream(raw);
   const endText = () => {
@@ -193,7 +224,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       const w = waiter;
       waiter = undefined;
       w(l);
-    } else queue.push(l);
+    } else if (running && tty) whileRunning(l);
+    else queue.push(l);
   };
   const flushBurst = () => {
     clearTimeout(burstTimer);
@@ -227,7 +259,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   });
   /** fresh: ignore type-ahead (for answers to questions, which must not be taken from earlier lines) */
   const nextLine = (prompt: string, fresh = false): Promise<string | null> => {
-    spinner.stop();
+    footer.clear();
     rl.setPrompt(prompt);
     atLineStart = true;
     waiterFresh = fresh;
@@ -245,9 +277,18 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   };
   /** an answer to a question: fresh input only, and kept out of the up-arrow history */
   const answer = async (prompt: string): Promise<string | null> => {
+    // a half-typed message from while the agent worked is put aside, not taken as the answer
+    const r = rl as unknown as { line: string; cursor: number };
+    const draft = r.line;
+    r.line = "";
+    r.cursor = 0;
     const a = await nextLine(prompt, true);
     const h = rlHistory();
     if (a !== null && h[0] === a) h.shift();
+    if (draft) {
+      r.line = draft;
+      r.cursor = draft.length;
+    }
     return a;
   };
   const remember = (input: string) => {
@@ -310,7 +351,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       const forward = (seq: string) => input.write(seq);
       if (!pasting && menu!.key(k, forward)) return;
       forward(k?.sequence ?? s);
-      setImmediate(() => menu!.update());
+      setImmediate(() => {
+        menu!.update();
+        footer.draw();
+      });
     });
     rl.on("close", () => {
       process.stdin.setRawMode(false);
@@ -332,7 +376,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   rl.on("SIGINT", () => {
     if (running) {
       running.abort();
-      spinner.stop();
+      for (const a of asides) a.abort();
       line(c.yellow("  ⏹ interrupted"));
       if (waiter) deliver(""); // a pending question is answered "no" below (empty + aborted)
       return;
@@ -428,10 +472,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
 
   const approvePlan = async (plan: string): Promise<PlanDecision> => {
     endText();
-    const rendered: string[] = [];
-    const r = new MarkdownStream((s) => rendered.push(...s.replace(/\n$/, "").split("\n")));
-    r.push(wrapText(plan, width() - 6).join("\n") + "\n");
-    line(box(rendered, "Plan", c.cyan));
+    line(mdBox(plan, "Plan", c.cyan));
     line(`${c.cyan("Approve this plan?")}
   ${c.bold("1")} yes, auto-accept edits    ${c.bold("2")} yes, ask before each change
   ${c.bold("3")} yes, auto mode            ${c.bold("n")} no, keep planning`);
@@ -462,10 +503,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         thinkingShown = true;
         raw(c.dim(c.italic(t)));
       },
-      onWaiting: (waiting) => {
-        if (waiting) spinner.start(depth ? "subagent working" : agent.mode === "plan" ? "planning" : "thinking");
-        else spinner.stop();
-      },
+      onWaiting: () => footer.draw(),
       onToolStart: (name, args) => {
         const list = started.get(name) ?? [];
         list.push(args);
@@ -502,13 +540,15 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
 
   const run = async (fn: (signal: AbortSignal) => Promise<unknown>) => {
     running = new AbortController();
+    runStarted = Date.now();
     md.reset();
+    footer.start();
     try {
       await fn(running.signal);
     } catch (e) {
       if (!running.signal.aborted) line(c.red(`  ✗ ${(e as Error).message}`));
     } finally {
-      spinner.stop();
+      footer.stop();
       endText();
       running = undefined;
       await status();
@@ -607,6 +647,63 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     tellModel(done, "reverted these files to how they were at session start");
   };
 
+  const showContext = async () => {
+    const used = agent.contextUsed();
+    const w = await agent.contextWindow();
+    const loaded = [...agent.registry.loaded].filter((n) => agent.registry.deferred.has(n));
+    line(
+      `  ${formatTokens(used)} / ${formatTokens(w)} tokens (${Math.round((used / w) * 100)}%) · ${agent.messages.length} messages` +
+        c.dim(`\n  auto-compact at ${Math.round(agent.settings.autoCompact * 100)}% · loaded deferred tools: ${loaded.join(", ") || "none"}`),
+    );
+  };
+
+  /** Markdown rendered into a box (side answers, plans). */
+  const mdBox = (text: string, title: string, paint: (s: string) => string) => {
+    const rendered: string[] = [];
+    const r = new MarkdownStream((x) => rendered.push(...x.replace(/\n$/, "").split("\n")));
+    r.push(wrapText(text, width() - 6).join("\n") + "\n");
+    return box(rendered, title, paint);
+  };
+
+  // ----- typing while the agent works -----
+  // ">note" goes to the main agent, ">#2 note" to subagent #2, a few /commands run right away,
+  // anything else is a question about the progress, answered on the side without touching the history.
+  const whileRunning = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    remember(t);
+    if (t.startsWith("/") && !isPathLike(t)) {
+      const cmd = t.slice(1).split(/\s+/)[0];
+      if (cmd === "status") line(renderStatus(agent.board));
+      else if (cmd === "context") void showContext();
+      else if (cmd === "files") showFiles();
+      else line(c.dim(`  While the agent works: /status, /context, /files; >note tells the agent something; other text asks about the progress.`));
+      return;
+    }
+    const steer = /^>\s*(?:#(\d+)\s+)?([\s\S]+)$/.exec(t);
+    if (steer) {
+      const id = Number(steer[1] ?? 0);
+      const note = steer[2].trim();
+      if (agent.steer(note, id)) line(c.gray("  ↳ ") + c.dim(`for ${id ? `#${id}` : "the agent"}, with its next step: `) + note);
+      else if (id) line(c.yellow(`  #${id} is not running. /status lists the agents.`));
+      else {
+        queue.push(note);
+        line(c.dim("  ↳ the agent has just finished: this will be the next message"));
+      }
+      return;
+    }
+    line(c.cyan("  ? ") + t);
+    const ac = new AbortController();
+    asides.add(ac);
+    agent
+      .askAside(t, ac.signal)
+      .then((a) => line(mdBox(a || "(no answer)", c.cyan("ⓘ"), c.cyan)))
+      .catch((e) => {
+        if (!ac.signal.aborted) line(c.red(`  ✗ side question failed: ${(e as Error).message}`));
+      })
+      .finally(() => asides.delete(ac));
+  };
+
   // ----- banner -----
   const reg = agent.registry;
   const win = (ctxWindow = await agent.contextWindow());
@@ -689,16 +786,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       case "compact":
         await run((signal) => agent.compact(ui, signal, { focus: args || undefined }));
         break;
-      case "context": {
-        const used = agent.contextUsed();
-        const w = await agent.contextWindow();
-        const loaded = [...reg.loaded].filter((n) => reg.deferred.has(n));
-        line(
-          `  ${formatTokens(used)} / ${formatTokens(w)} tokens (${Math.round((used / w) * 100)}%) · ${agent.messages.length} messages` +
-            c.dim(`\n  auto-compact at ${Math.round(agent.settings.autoCompact * 100)}% · loaded deferred tools: ${loaded.join(", ") || "none"}`),
-        );
+      case "context":
+        await showContext();
         break;
-      }
       case "thinking":
         showThinking = !showThinking;
         line(c.dim(`  reasoning ${showThinking ? "shown" : "hidden"}`));

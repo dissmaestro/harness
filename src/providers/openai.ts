@@ -124,7 +124,8 @@ async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig):
   const body: Record<string, unknown> = {
     model: settings.model,
     messages: req.messages,
-    tools: req.tools.map(toolSpec),
+    // OpenAI rejects an empty tools array
+    ...(req.tools.length && { tools: req.tools.map(toolSpec) }),
     stream: true,
     stream_options: { include_usage: true },
   };

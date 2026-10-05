@@ -6,7 +6,7 @@ import type { AgentDef, Registry } from "../registry/registry.ts";
 import { EXIT_PLAN_MODE } from "../tools/session-tools.ts";
 import { USE_TOOL } from "../tools/UseTool.ts";
 import type { Message, Session, Tool, ToolCall, ToolContext } from "../types.ts";
-import { oneLine, resolvePath } from "../util.ts";
+import { oneLine, resolvePath, truncateMiddle } from "../util.ts";
 import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
@@ -79,6 +79,13 @@ const SUBAGENT_FORBIDDEN = new Set(["Agent", EXIT_PLAN_MODE]);
 const TRUNCATED_CALL =
   "Error: your output hit the token limit while writing this tool call, so its arguments are incomplete and it was NOT executed. " +
   "Send it again in smaller pieces: for a big file, Write a short skeleton first and then add the rest with several Edit calls.";
+const USER_NOTES = (notes: string[]) =>
+  `The user wrote this while you were working. Take it into account now (it may change what you should do next):\n${notes.map((n) => `- ${n}`).join("\n")}`;
+const ASIDE_PROMPT =
+  "You answer the user's questions about a coding agent that is working right now in their terminal. " +
+  "You get a snapshot of every agent (main agent and subagents: step, running tool, checklist) and the main agent's latest messages. " +
+  "Answer briefly and concretely from that information: what is being done, at which stage, what is left. " +
+  "Do not invent progress that is not in the snapshot; say so when you cannot tell. Answer in the language of the question.";
 const EMPTY_REPLY = "Your last reply was empty. Continue the task, or if it is finished, give your final answer to the user.";
 const FINAL_STEP = (why: string) =>
   `${why} Do not call any more tools. Write your final answer now: what you did, what you found, and what is left to do.`;
@@ -191,6 +198,44 @@ export class Agent {
       else if (was === "plan") this.pendingReminders.push(PLAN_MODE_OFF(MODES[mode].label));
     }
     this.onModeChange?.(mode);
+  }
+
+  // ---------- talking to running agents ----------
+
+  /** A note for a running agent (the main one, or subagent #id): it gets it with its next step. */
+  steer(text: string, id = 0): boolean {
+    const a = this.board.find(id);
+    if (!a || a.state !== "running") return false;
+    a.notes.push(text);
+    return true;
+  }
+
+  /**
+   * Answers a question about the work in progress from the activity board and the latest messages,
+   * in a separate request: no tools, nothing is added to the history.
+   */
+  async askAside(question: string, signal: AbortSignal): Promise<string> {
+    const tail = this.messages
+      .slice(1)
+      .slice(-8)
+      .map((m) => {
+        const calls = m.role === "assistant" && m.tool_calls?.length ? ` (called ${m.tool_calls.map((t) => t.function.name).join(", ")})` : "";
+        return `[${m.role}${calls}] ${truncateMiddle(String(m.content ?? ""), 1500)}`;
+      })
+      .join("\n\n");
+    const res = await chat(this.settings, {
+      messages: [
+        { role: "system", content: ASIDE_PROMPT },
+        {
+          role: "user",
+          content: `Agents right now:\n${this.board.snapshot()}\n\nLatest messages of the main agent (oldest first):\n${tail || "(none yet)"}\n\nQuestion: ${question}`,
+        },
+      ],
+      tools: [],
+      signal,
+      maxTokens: 1024,
+    });
+    return stripThinking(res.content).trim();
   }
 
   // ---------- context accounting ----------
@@ -354,6 +399,11 @@ export class Agent {
           this.push({ role: "user", content: reminder(EMPTY_REPLY) });
           continue;
         }
+        if (this.activity.notes.length) {
+          // the user wrote something while the model was answering: don't end the turn without it
+          this.push({ role: "user", content: reminder(USER_NOTES(this.activity.notes.splice(0))) });
+          continue;
+        }
         const stop = await this.hook(ui, "Stop", { last_message: text }, undefined, signal);
         if (stop.blocked && stopRetries++ < MAX_STOP_HOOK_RETRIES) {
           this.push({ role: "user", content: reminder(`Stop hook feedback:\n${stop.feedback}`) });
@@ -385,8 +435,9 @@ export class Agent {
             result += `\n\n${reminder(`You have made this exact ${call.function.name} call ${n} times in this task. Repeating it will not give a different result: change your approach, or stop and tell the user what is blocking you.`)}`;
           }
         }
-        // Mode changes made while the model works are reported with the next tool result (append-only).
+        // Mode changes and notes typed by the user while the model works go with the next tool result (append-only).
         if (this.pendingReminders.length) result += "\n\n" + this.pendingReminders.splice(0).map(reminder).join("\n");
+        if (this.activity.notes.length) result += "\n\n" + reminder(USER_NOTES(this.activity.notes.splice(0)));
         this.push({ role: "tool", tool_call_id: call.id, content: result });
       }
       if (signal.aborted) return "";

@@ -39,6 +39,8 @@ export const SHORTCUTS: [string, string][] = [
   ["tab", "complete the selected item"],
   ["↑ ↓", "move in the menu, otherwise input history"],
   ["esc", "close the menu"],
+  ["text enter", "while agents work: ask what is going on (answered on the side)"],
+  ["> text", "while agents work: tell the agent (>#2 text: subagent #2)"],
   ["ctrl+c", "interrupt the answer · clear the line · twice: quit"],
   ["ctrl+d", "quit"],
   ["ctrl+l", "clear the screen"],

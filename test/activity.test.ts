@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { ActivityBoard, formatDuration } from "../src/core/activity.ts";
 import { Agent } from "../src/core/loop.ts";
@@ -75,4 +77,52 @@ test("idle status and durations", () => {
   assert.equal(formatDuration(5_000), "5s");
   assert.equal(formatDuration(65_000), "1m05s");
   assert.equal(formatDuration(3_660_000), "1h01m");
+});
+
+test("steer: a note goes with the next tool result; a note during the final answer gets its own request", async () => {
+  const srv = await fakeServer([call("Read", { file_path: "a.txt" }), text("first answer"), text("answer with the note")]);
+  try {
+    const home = tempDir();
+    const cwd = tempDir();
+    writeFileSync(join(cwd, "a.txt"), "hello\n");
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home });
+    let sentDuringText = false;
+    const ui = {
+      ...silentUI([]),
+      onToolStart: () => assert.equal(agent.steer("use tabs"), true),
+      onText: () => {
+        if (!sentDuringText) sentDuringText = agent.steer("and add a test");
+      },
+    };
+    const answer = await agent.send("go", ui, new AbortController().signal);
+    const toolMsg = srv.requests[1].messages.find((m: any) => m.role === "tool");
+    assert.match(toolMsg.content, /wrote this while you were working[\s\S]*- use tabs/);
+    assert.equal(srv.requests.length, 3);
+    assert.match(srv.requests[2].messages.at(-1).content, /- and add a test/);
+    assert.equal(answer, "first answer\nanswer with the note");
+    assert.equal(agent.steer("too late"), false, "nothing is running any more");
+  } finally {
+    srv.close();
+  }
+});
+
+test("askAside: no tools, answer from the board, history untouched", async () => {
+  const srv = await fakeServer([text("it is reading files")]);
+  try {
+    const home = tempDir();
+    const cwd = tempDir();
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home });
+    const before = agent.messages.length;
+    const a = await agent.askAside("what is going on?", new AbortController().signal);
+    assert.equal(a, "it is reading files");
+    assert.equal(agent.messages.length, before);
+    assert.equal(srv.requests[0].tools, undefined);
+    assert.match(srv.requests[0].messages[1].content, /Agents right now:[\s\S]*main[\s\S]*Question: what is going on\?/);
+  } finally {
+    srv.close();
+  }
 });
