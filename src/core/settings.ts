@@ -53,6 +53,8 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** a map of the repository's main symbols sent at the start of each conversation; false = off */
+  repoMap?: false | { tokens?: number; subagentTokens?: number };
   /** errors of an edited file (language server or syntax check) appended to the Edit/Write result; false = off */
   diagnostics?: boolean | DiagnosticsConfig;
   /** snapshot the project in a shadow git repo before every changing tool call (/restore) */

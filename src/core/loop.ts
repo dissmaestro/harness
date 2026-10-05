@@ -12,6 +12,7 @@ import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { type Checkpoint, Checkpoints } from "./checkpoints.ts";
 import { Diagnostics } from "./diagnostics.ts";
+import { buildRepoMap } from "./repomap.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
@@ -127,6 +128,8 @@ export class Agent {
   private checkpointStore: Checkpoints | undefined;
   private checkpointWarned = false;
   private diagnosticsStore: Diagnostics | undefined;
+  /** the repository map, built once per session (per budget) */
+  private repoMaps = new Map<number, string>();
   /** the current turn of the main agent: its message and the history length before it */
   private turn = { prompt: "", history: 0 };
   /** what every agent of this session is doing (shared with subagents) */
@@ -239,6 +242,35 @@ export class Agent {
     if (cfg === false) return undefined;
     this.diagnosticsStore ??= new Diagnostics(this.cwd, typeof cfg === "object" ? cfg : {});
     return this.diagnosticsStore;
+  }
+
+  // ---------- repository map ----------
+
+  /** The repository map for this agent ("" when off, not a code project, or a subagent that doesn't read code). */
+  repoMap(refresh = false): string {
+    const cfg = this.settings.repoMap;
+    if (cfg === false) return "";
+    const def = this.subagent;
+    // subagents that work on the code (all tools, or Bash like explore) get it; web researchers don't
+    if (def && def.tools !== "*" && !def.tools.includes("Bash")) return "";
+    const tokens = def ? (cfg?.subagentTokens ?? 1000) : (cfg?.tokens ?? 1500);
+    if (tokens <= 0) return "";
+    const root = this.parent ?? this;
+    const key = tokens * 1_000_003 + (this.cwd === root.cwd ? 0 : 1);
+    let map = root.repoMaps.get(key);
+    if (map === undefined || refresh) {
+      try {
+        map = buildRepoMap(this.cwd, { tokens });
+      } catch {
+        map = "";
+      }
+      root.repoMaps.set(key, map);
+    }
+    return map
+      ? "Repository map: the main symbols of the most referenced source files (line: symbol), built when the session started. " +
+          "Use it to decide which files to open; read a file before relying on details, it may have changed since.\n" +
+          map
+      : "";
   }
 
   // ---------- checkpoints ----------
@@ -401,6 +433,11 @@ export class Agent {
       this.lastCatalog = catalog;
     }
     extras.push(...this.pendingReminders.splice(0));
+    // a fresh conversation (or subagent) starts with the repository map
+    if (!this.messages.some((m) => m.role === "user")) {
+      const map = this.repoMap();
+      if (map) extras.push(map);
+    }
     const content = [userText, ...extras.map(reminder)].join("\n\n");
     // After a failed or interrupted turn the history may end with a user message or a dangling tool call:
     // repair it so strict chat templates (alternating roles) keep working.
@@ -966,6 +1003,8 @@ export class Agent {
     const loaded = [...this.registry.loaded].filter((n) => this.registry.deferred.has(n));
     if (loaded.length) parts.push(reminder(`Deferred tools already loaded (call them with UseTool):\n${functionsBlock(this.registry, loaded)}`));
     if (this.mode === "plan" && !this.subagent) parts.push(reminder(PLAN_MODE_ON));
+    const map = this.repoMap();
+    if (map) parts.push(reminder(map));
     if (opts.midTurn) parts.push("Continue the current task from where you left off. Re-read files before editing them.");
 
     const next: Message[] = [{ role: "system", content: this.systemPrompt }, { role: "user", content: parts.join("\n\n") }];

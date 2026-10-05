@@ -33,6 +33,7 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Commands", name: "compact", args: "[focus]", description: "summarize the conversation to free context" },
   { group: "Commands", name: "status", description: "what every agent is doing: step, tool, checklist (works while agents run)" },
   { group: "Commands", name: "context", description: "context usage" },
+  { group: "Commands", name: "map", args: "[refresh]", description: "the repository map the model gets; refresh rebuilds it for new conversations" },
   { group: "Commands", name: "clear", description: "start a new conversation" },
   { group: "Commands", name: "fork", args: "[#n] [name]", description: "continue in a copy of this conversation (from checkpoint #n's turn); the original is kept" },
   { group: "Commands", name: "tree", description: "saved conversations of this folder and their forks" },
@@ -912,6 +913,12 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       case "restore":
         await restoreCmd(args.trim());
         break;
+      case "map": {
+        const map = agent.repoMap(args.trim() === "refresh");
+        if (!map) line(c.dim("  No repository map (not a code project, or \"repoMap\": false)."));
+        else page(map.split("\n").slice(1).join("\n") + "\n" + c.dim(`(~${Math.round(map.length / 3.5)} tokens; "repoMap": {"tokens": N} changes the size)`), rl);
+        break;
+      }
       case "fork":
         await forkCmd(args.trim());
         break;
