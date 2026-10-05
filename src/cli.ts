@@ -6,7 +6,7 @@ import { findSession, listSessions } from "./core/sessions.ts";
 import { loadSettings } from "./core/settings.ts";
 import type { Registry } from "./registry/registry.ts";
 import { loadRegistry } from "./registry/load.ts";
-import { runHeadless } from "./ui/headless.ts";
+import { type OutputFormat, runHeadless } from "./ui/headless.ts";
 import { c, configureLinks } from "./ui/render.ts";
 import { runRepl } from "./ui/repl.ts";
 import { killAllProcesses, VERSION } from "./util.ts";
@@ -15,6 +15,10 @@ const USAGE = `Usage: agent [options] [prompt]
   [prompt]               start the REPL with this first message (with -p: run it headless)
   -p, --print            run the prompt non-interactively and print the answer;
                          piped stdin is appended: cat log | agent -p "explain"
+      --output-format <f> with -p: text (default) | json (one object at the end:
+                         answer, tool calls, changed files, context) | stream-json
+                         (one JSON event per line, then the result)
+      --json             same as --output-format json
   -m, --model <name>     model name sent to the server
       --base-url <url>   OpenAI-compatible endpoint (default http://localhost:8080/v1)
       --api-key <key>    API key sent as "Authorization: Bearer <key>" (server --api-key)
@@ -68,6 +72,8 @@ async function main() {
     allowPositionals: true,
     options: {
       print: { type: "boolean", short: "p" },
+      "output-format": { type: "string" },
+      json: { type: "boolean" },
       model: { type: "string", short: "m" },
       "base-url": { type: "string" },
       "api-key": { type: "string" },
@@ -121,6 +127,9 @@ async function main() {
     if (input) prompt = `${prompt}\n\n<stdin>\n${input}\n</stdin>`.trimStart();
   }
   if (values.print && !prompt) throw new Error('-p needs a prompt: agent -p "your task" (or pipe text into stdin).');
+  const format = (values.json ? "json" : (values["output-format"] ?? "text")) as OutputFormat;
+  if (!["text", "json", "stream-json"].includes(format)) throw new Error(`Unknown --output-format "${format}". Use text, json or stream-json.`);
+  if (format !== "text" && !values.print) throw new Error(`--output-format ${format} works with -p.`);
 
   const settings = loadSettings(cwd);
   if (values.model) settings.model = values.model;
@@ -148,7 +157,7 @@ async function main() {
   }
 
   if (values.print) {
-    const code = await runHeadless(agent, prompt, warnings);
+    const code = await runHeadless(agent, prompt, warnings, format);
     process.exit(code);
   }
   interactive = true;

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fakeServer, tempDir, text } from "./helpers.ts";
+import { call, fakeServer, tempDir, text } from "./helpers.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
 
@@ -69,4 +69,34 @@ test("cli: --api-key is sent as a bearer token; -p reports context usage on stde
   } finally {
     srv.close();
   }
+});
+
+test("cli: -p --json prints one result object; stream-json prints events then the result", async () => {
+  const srv = await fakeServer([call("Write", { file_path: "out.txt", content: "hi\n" }), text("wrote it")]);
+  try {
+    const r = await run(["-p", "write a file", "--base-url", srv.url, "--accept-edits", "--json"]);
+    assert.equal(r.code, 0, r.stderr);
+    const res = JSON.parse(r.stdout);
+    assert.equal(res.type, "result");
+    assert.equal(res.ok, true);
+    assert.equal(res.answer, "wrote it");
+    assert.deepEqual(res.filesChanged, [{ path: "out.txt", status: "A", added: 1, removed: 0 }]);
+    assert.equal(res.toolCalls[0].name, "Write");
+    assert.equal(res.toolCalls[0].ok, true);
+    assert.equal(res.steps, 2);
+  } finally {
+    srv.close();
+  }
+  const srv2 = await fakeServer([call("Bash", { command: "rm -rf build" }), text("could not")]);
+  try {
+    const r = await run(["-p", "clean", "--base-url", srv2.url, "--output-format", "stream-json"]);
+    const events = r.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual([...new Set(events.map((e) => e.type))], ["tool_start", "denied", "tool_end", "text", "result"]);
+    assert.equal(events.at(-1).denied.length, 1);
+  } finally {
+    srv2.close();
+  }
+  const bad = await run(["--json"]);
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /works with -p/);
 });
