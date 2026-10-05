@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "CLI coding agent for local models with lazy skills and deferred tools",
   "license": "MIT",
   "type": "module",

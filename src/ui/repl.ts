@@ -313,9 +313,11 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       out.write(prompt + l.replace(/\n/g, "\n  ") + "\n");
       return Promise.resolve(l);
     }
-    rl.prompt();
     if (closed) return Promise.resolve(null);
+    // the waiter first: while the agent runs, the input is only drawn (unmuted) once someone waits for it;
+    // drawing the prompt before that made questions like "Allow?" invisible until a key was pressed
     const p = new Promise<string | null>((r) => (waiter = r));
+    rl.prompt();
     menu?.update(true);
     return p;
   };
