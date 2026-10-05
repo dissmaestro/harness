@@ -29,6 +29,7 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Commands", name: "help", description: "commands and keyboard shortcuts" },
   { group: "Commands", name: "keys", description: "keyboard shortcuts (or type ?)" },
   { group: "Commands", name: "mode", args: "[name]", description: "show or switch mode" },
+  { group: "Commands", name: "ask", args: "<question>", description: "answer only: nothing is changed for this message (also: \"ничего не трогай\", \"just answer\")" },
   { group: "Commands", name: "plan", args: "[task]", description: "plan mode: research read-only, then a plan" },
   { group: "Commands", name: "auto", args: "[task]", description: "auto mode: everything except dangerous actions" },
   { group: "Commands", name: "compact", args: "[focus]", description: "summarize the conversation to free context" },
@@ -936,6 +937,18 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         break;
       case "status":
         line(renderStatus(agent.board));
+        break;
+      case "ask":
+        if (!args.trim()) {
+          line(c.dim("  /ask <question>: the agent only looks and answers, nothing is changed."));
+          break;
+        }
+        agent.forceReadOnly = true;
+        {
+          const { text, attached } = expandMentions(args.trim(), agent.cwd);
+          for (const a of attached) line(c.gray("  ⎿ ") + c.dim(`@${a.path} (${a.summary})`));
+          await ask(text);
+        }
         break;
       case "verify":
         await verify(args.trim() === "fix");

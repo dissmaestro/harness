@@ -14,6 +14,7 @@ import { type Checkpoint, Checkpoints } from "./checkpoints.ts";
 import { Diagnostics } from "./diagnostics.ts";
 import { resolveRequest } from "./profile.ts";
 import { buildRepoMap } from "./repomap.ts";
+import { QUESTION_REMINDER, READONLY_DENIED, READONLY_REMINDER, classifyIntent } from "./intent.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
@@ -133,6 +134,10 @@ export class Agent {
   private repoMaps = new Map<number, string>();
   /** the current turn of the main agent: its message and the history length before it */
   private turn = { prompt: "", history: 0 };
+  /** the user asked not to change anything in the current message: edits and changing commands are refused */
+  turnReadOnly = false;
+  /** the next message is read-only whatever it says (/ask) */
+  forceReadOnly = false;
   /** what every agent of this session is doing (shared with subagents) */
   board: ActivityBoard;
   activity: Activity;
@@ -429,11 +434,19 @@ export class Agent {
       ui.onInfo(`Prompt blocked by hook: ${hook.feedback}`);
       return "";
     }
+    const extras: string[] = [];
     if (!this.subagent) {
       this.changes.beginTurn(userText);
       this.turn = { prompt: userText, history: this.messages.length };
+      // "ничего не трогай" / "just answer" is enforced for the whole message; a question only gets a reminder
+      const intent = this.forceReadOnly ? "readonly" : classifyIntent(userText);
+      this.forceReadOnly = false;
+      this.turnReadOnly = intent === "readonly";
+      if (intent === "readonly") {
+        extras.push(READONLY_REMINDER);
+        ui.onInfo("read-only for this message (you asked not to change anything): edits and changing commands will be refused");
+      } else if (intent === "question" && this.mode !== "plan") extras.push(QUESTION_REMINDER);
     }
-    const extras: string[] = [];
     if (hook.context) extras.push(hook.context);
     // The catalog is appended (never put in the system prompt) and only re-sent when it changes.
     const catalog = this.catalogForThisAgent();
@@ -771,12 +784,13 @@ export class Agent {
 
   /** true, or the message returned to the model when the call is refused */
   private async permit(tool: Tool, args: Record<string, unknown>, ui: AgentUI): Promise<true | string> {
-    const readOnly = this.subagent?.readOnly;
     const root = this.parent ?? this;
+    const readOnly = this.subagent?.readOnly || root.turnReadOnly;
     const decision = decide(readOnly ? "plan" : root.mode, tool, args, this.cwd);
     if (decision.action === "allow") return true;
     if (decision.action === "deny") {
-      return readOnly ? `${tool.name} is not allowed: this subagent is read-only.` : decision.reason;
+      if (this.subagent?.readOnly) return `${tool.name} is not allowed: this subagent is read-only.`;
+      return root.turnReadOnly ? READONLY_DENIED(tool.name) : decision.reason;
     }
     const risky = decision.reason !== undefined;
     if (!risky && this.sessionAllowed.has(tool.name)) return true;
