@@ -18,6 +18,7 @@ import { InputMenu } from "./menu.ts";
 import { Footer, MutableOutput, columnAfter } from "./footer.ts";
 import { activitySummary, renderStatus } from "./status.ts";
 import { formatDuration } from "../core/activity.ts";
+import { type CheckResult, detectChecks, failureReport, runChecks } from "../core/verify.ts";
 import { page } from "./pager.ts";
 import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, fileLink, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
 
@@ -44,6 +45,7 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Changes", name: "undo", description: "restore the files the last turn changed" },
   { group: "Changes", name: "revert", args: "[path]", description: "restore files to how they were at session start" },
   { group: "Changes", name: "last", description: "full output of the last tool" },
+  { group: "Changes", name: "verify", args: "[fix]", description: "run the lint/test commands now; /verify fix hands a failure to the agent" },
 ];
 
 const key = (k: string) => k.split(" ").map((x) => c.cyan(x)).join(c.dim(" "));
@@ -690,6 +692,30 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return box(rendered, title, paint);
   };
 
+  const verify = async (fix: boolean) => {
+    const cfg = agent.settings.verify;
+    if (!cfg?.test && !cfg?.lint) {
+      const guess = detectChecks(agent.cwd);
+      const example = JSON.stringify({ verify: { ...(guess.lint && { lint: guess.lint }), test: guess.test ?? "npm test" } });
+      line(c.dim(`  No verify commands configured. Add to .agent/settings.json: ${example}`));
+      return;
+    }
+    let failed: CheckResult | undefined;
+    await run(async (signal) => {
+      const results = await runChecks(cfg, agent.cwd, signal, (name, command) => line(c.dim(`  ${name}: ${command}`)));
+      for (const r of results) {
+        const head = `  ${r.ok ? c.green("✓") : c.red("✗")} ${r.name} ${c.dim(`(${Math.round(r.ms / 1000)}s${r.ok ? "" : r.timedOut ? ", timeout" : `, exit ${r.code}`})`)}`;
+        line(head);
+        if (!r.ok) {
+          failed = r;
+          line(c.dim(r.output.split("\n").slice(-15).map((l) => "    " + l).join("\n")));
+        }
+      }
+    });
+    if (failed && fix) await ask(failureReport(failed));
+    else if (failed) line(c.dim("  /verify fix hands this failure to the agent."));
+  };
+
   // ----- typing while the agent works -----
   // ">note" goes to the main agent, ">#2 note" to subagent #2, a few /commands run right away,
   // anything else is a question about the progress, answered on the side without touching the history.
@@ -788,6 +814,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         break;
       case "status":
         line(renderStatus(agent.board));
+        break;
+      case "verify":
+        await verify(args.trim() === "fix");
         break;
       case "clear":
         agent.reset();

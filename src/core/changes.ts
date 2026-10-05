@@ -125,6 +125,11 @@ export class ChangeTracker {
     return !fc || fc.untracked ? undefined : fc.base;
   }
 
+  /** How many files the current turn has written so far. */
+  writesThisTurn(): number {
+    return this.checkpoints.at(-1)?.files.size ?? 0;
+  }
+
   /** Files of the last turn that changed something (what undo() would restore), without touching anything. */
   peekUndo(): { turn: string; paths: string[] } | undefined {
     for (let i = this.checkpoints.length - 1; i >= 0; i--) {

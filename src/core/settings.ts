@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { HooksConfig } from "../hooks/hooks.ts";
 import { parseMode, type Mode } from "./modes.ts";
+import type { VerifyConfig } from "./verify.ts";
 
 export interface McpServerConfig {
   command: string;
@@ -51,6 +52,8 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** lint/test commands run after a turn that changed files; failures go back to the model */
+  verify?: VerifyConfig;
 }
 
 const DEFAULTS: Settings = {

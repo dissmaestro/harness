@@ -12,7 +12,8 @@ import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
-import { MODES, decide, type Mode } from "./modes.ts";
+import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
+import { failureReport, runChecks } from "./verify.ts";
 import { SessionJournal, readSession, sanitizeHistory } from "./sessions.ts";
 import type { Settings } from "./settings.ts";
 import { coerceArgs, validateArgs } from "./validate.ts";
@@ -118,6 +119,8 @@ export class Agent {
   sessionAllowed = new Set<string>();
   /** a subagent follows its parent's mode, so shift+tab during its run applies to it too */
   parent: Agent | undefined;
+  /** a command that may change files ran during this turn (for automatic verification) */
+  private execRan = false;
   /** what every agent of this session is doing (shared with subagents) */
   board: ActivityBoard;
   activity: Activity;
@@ -209,6 +212,42 @@ export class Agent {
     this.onModeChange?.(mode);
   }
 
+  // ---------- verification ----------
+
+  /**
+   * After a turn that changed files: runs the configured lint and test commands; on failure the output
+   * goes back to the model to fix, up to verify.maxFixes times.
+   */
+  private async verifyLoop(answer: string, ui: AgentUI, signal: AbortSignal): Promise<string> {
+    const cfg = this.settings.verify;
+    if (!cfg || cfg.auto === false || (!cfg.test && !cfg.lint)) return answer;
+    if (!this.changes.writesThisTurn() && !this.execRan) return answer;
+    const max = cfg.maxFixes ?? 3;
+    for (let fix = 0; !signal.aborted; fix++) {
+      const t0 = Date.now();
+      const results = await runChecks(cfg, this.cwd, signal, (name, command) => {
+        this.activity.update({ tool: { name: "verify", summary: command, since: Date.now() } });
+        ui.onInfo(`verify (${name}): ${command}`);
+      });
+      this.activity.update({ tool: undefined });
+      if (signal.aborted) break;
+      const failed = results.find((r) => !r.ok);
+      if (!failed) {
+        ui.onInfo(`verify: ${results.map((r) => `${r.name} ✓`).join(", ")} (${Math.round((Date.now() - t0) / 1000)}s)`);
+        break;
+      }
+      if (fix >= max) {
+        ui.onInfo(`verify: ${failed.name} still fails after ${max} fix attempts; stopping here`);
+        answer += `\n\n(${failed.name} still fails: \`${failed.command}\`)`;
+        break;
+      }
+      ui.onInfo(`verify: ${failed.name} failed (${failed.timedOut ? "timeout" : `exit ${failed.code}`}); the model will fix it (attempt ${fix + 1}/${max})`);
+      this.push({ role: "user", content: reminder(failureReport(failed)) });
+      answer = await this.runLoop(ui, signal);
+    }
+    return answer;
+  }
+
   // ---------- talking to running agents ----------
 
   /** A note for a running agent (the main one, or subagent #id): it gets it with its next step. */
@@ -290,9 +329,11 @@ export class Agent {
     } else this.push({ role: "user", content });
     if (this.subagent) return this.runLoop(ui, signal);
     this.activity.restart();
+    this.execRan = false;
     let state: "done" | "failed" = "failed";
     try {
-      const answer = await this.runLoop(ui, signal);
+      let answer = await this.runLoop(ui, signal);
+      answer = await this.verifyLoop(answer, ui, signal);
       state = "done";
       return answer;
     } finally {
@@ -531,6 +572,7 @@ export class Agent {
       ui.onToolEnd(name, permission, true);
       return permission;
     }
+    if (tool.kind === "exec" && !(name === "Bash" && isReadOnlyCommand(String(args.command ?? "")))) (this.parent ?? this).execRan = true;
     const pre = await this.hook(ui, "PreToolUse", { tool_name: name, tool_input: args }, name, signal);
     if (pre.blocked) {
       const msg = `Blocked by PreToolUse hook: ${pre.feedback}`;

@@ -28,6 +28,8 @@ const USAGE = `Usage: agent [options] [prompt]
       --accept-edits     same as --mode acceptEdits
       --yolo             same as --mode yolo (never ask)
       --max-steps <n>    stop after n model turns per prompt (default 60)
+      --test-cmd <cmd>   run after a turn that changed files; failures go back to the model
+      --lint-cmd <cmd>   same, run before the tests
   -c, --continue         continue the latest conversation in this directory
   -r, --resume [id]      continue a saved conversation (without id: list them)
   -v, --version
@@ -83,6 +85,8 @@ async function main() {
       "accept-edits": { type: "boolean" },
       yolo: { type: "boolean" },
       "max-steps": { type: "string" },
+      "test-cmd": { type: "string" },
+      "lint-cmd": { type: "string" },
       continue: { type: "boolean", short: "c" },
       resume: { type: "boolean", short: "r" },
       version: { type: "boolean", short: "v" },
@@ -135,6 +139,9 @@ async function main() {
   if (values.model) settings.model = values.model;
   if (values["base-url"]) settings.baseUrl = values["base-url"];
   if (values["api-key"]) settings.apiKey = values["api-key"];
+  if (values["test-cmd"] || values["lint-cmd"]) {
+    settings.verify = { ...settings.verify, ...(values["test-cmd"] && { test: values["test-cmd"] }), ...(values["lint-cmd"] && { lint: values["lint-cmd"] }) };
+  }
   configureLinks(settings);
   if (values["accept-edits"]) settings.permissionMode = "acceptEdits";
   if (values.plan) settings.permissionMode = "plan";
