@@ -7,6 +7,7 @@ import { EXIT_PLAN_MODE } from "../tools/session-tools.ts";
 import { USE_TOOL } from "../tools/UseTool.ts";
 import type { Message, Session, Tool, ToolCall, ToolContext } from "../types.ts";
 import { oneLine, resolvePath } from "../util.ts";
+import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, type Mode } from "./modes.ts";
@@ -58,6 +59,9 @@ export interface AgentOptions {
   persist?: boolean;
   /** shared with subagents so /diff and /undo see every change */
   changes?: ChangeTracker;
+  /** a subagent's entry on its parent's activity board */
+  activity?: Activity;
+  board?: ActivityBoard;
 }
 
 const MAX_STOP_HOOK_RETRIES = 3;
@@ -98,6 +102,9 @@ export class Agent {
   sessionAllowed = new Set<string>();
   /** a subagent follows its parent's mode, so shift+tab during its run applies to it too */
   parent: Agent | undefined;
+  /** what every agent of this session is doing (shared with subagents) */
+  board: ActivityBoard;
+  activity: Activity;
   private persist: boolean;
   private systemPrompt: string;
   private lastCatalog = "";
@@ -116,6 +123,8 @@ export class Agent {
     this.mode = opts.mode ?? opts.settings.permissionMode;
     this.persist = !!opts.persist && !opts.subagent;
     this.changes = opts.changes ?? new ChangeTracker();
+    this.board = opts.board ?? new ActivityBoard(opts.cwd, this.maxSteps);
+    this.activity = opts.activity ?? this.board.root;
     this.systemPrompt = buildSystemPrompt(opts.cwd, opts.settings, opts.home, opts.subagent);
     this.reset();
   }
@@ -225,7 +234,16 @@ export class Agent {
     if (last.role === "user" || (last.role === "assistant" && last.tool_calls?.length)) {
       this.replaceHistory(sanitizeHistory([...this.messages, { role: "user", content }]));
     } else this.push({ role: "user", content });
-    return this.runLoop(ui, signal);
+    if (this.subagent) return this.runLoop(ui, signal);
+    this.activity.restart();
+    let state: "done" | "failed" = "failed";
+    try {
+      const answer = await this.runLoop(ui, signal);
+      state = "done";
+      return answer;
+    } finally {
+      this.activity.finish(state);
+    }
   }
 
   private catalogForThisAgent(): string {
@@ -241,6 +259,7 @@ export class Agent {
   private async request(ui: AgentUI, signal: AbortSignal): Promise<ChatResult> {
     for (let compacted = false; ; ) {
       ui.onWaiting?.(true);
+      let streamed = "";
       try {
         return await chat(this.settings, {
           messages: this.messages,
@@ -249,6 +268,8 @@ export class Agent {
           onText: (t) => {
             ui.onWaiting?.(false);
             ui.onText(t);
+            streamed += t;
+            this.activity.setText(stripThinking(streamed));
           },
           onReasoning: ui.onReasoning ? (t) => ui.onReasoning!(t) : undefined,
           onRetry: (m) => {
@@ -290,11 +311,13 @@ export class Agent {
       }
       if (await this.shouldCompact()) await this.compact(ui, signal, { midTurn: true });
 
+      this.activity.update({ step: step + 1, maxSteps: this.maxSteps });
       const res = await this.request(ui, signal);
       if (res.usage) {
         this.lastUsage = res.usage;
         this.usageAtMessages = this.messages.length;
       }
+      this.activity.update({ contextUsed: this.contextUsed(), contextWindow: await this.contextWindow() });
       this.lastTimings = res.timings ?? this.lastTimings;
       const cutOff = res.finishReason === "length";
 
@@ -417,6 +440,16 @@ export class Agent {
     if (invalid) return fail(`InputValidationError: ${invalid}\nExpected schema: ${JSON.stringify(tool.parameters)}`, args);
 
     ui.onToolStart(name, args);
+    if (name === "TodoWrite" && Array.isArray(args.todos)) this.activity.update({ todos: args.todos as Todo[] });
+    this.activity.update({ tool: { name, summary: this.board.toolSummary(name, args), since: Date.now() } });
+    try {
+      return await this.execPermitted(name, tool, args, ui, signal);
+    } finally {
+      this.activity.update({ tool: undefined });
+    }
+  }
+
+  private async execPermitted(name: string, tool: Tool, args: Record<string, unknown>, ui: AgentUI, signal: AbortSignal): Promise<string> {
     const permission = await this.permit(tool, args, ui);
     if (permission !== true) {
       ui.onToolEnd(name, permission, true);
@@ -508,6 +541,7 @@ export class Agent {
   private async runSubagent(type: string, prompt: string, description: string, ui: AgentUI, signal: AbortSignal): Promise<string> {
     const def = this.registry.agents.get(type);
     if (!def) throw new Error(`Unknown subagent type "${type}". Available: ${[...this.registry.agents.keys()].join(", ")}.`);
+    const activity = this.board.add(this.activity, def.name, description, 30);
     const child = new Agent({
       cwd: this.cwd,
       settings: this.settings,
@@ -516,6 +550,8 @@ export class Agent {
       subagent: def,
       mode: this.mode,
       changes: this.changes,
+      board: this.board,
+      activity,
     });
     child.sessionAllowed = this.sessionAllowed;
     child.parent = this.parent ?? this;
@@ -523,7 +559,9 @@ export class Agent {
     let answer: string;
     try {
       answer = await child.send(prompt, childUi, signal);
+      activity.finish("done");
     } catch (e) {
+      activity.finish("failed");
       if (signal.aborted) throw e;
       // The subagent died (server gone for longer than the retry window, a bug…): hand back what it had
       // done so far instead of losing it, so the parent can continue or re-delegate the rest.

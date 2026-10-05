@@ -15,6 +15,7 @@ import { langFromPath, lineHighlighter } from "./highlight.ts";
 import { type CommandInfo, SHORTCUTS, complete, expandMentions, projectFiles } from "./complete.ts";
 import { MarkdownStream } from "./markdown.ts";
 import { InputMenu } from "./menu.ts";
+import { renderStatus } from "./status.ts";
 import { page } from "./pager.ts";
 import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
 import { Spinner } from "./spinner.ts";
@@ -27,6 +28,7 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Commands", name: "plan", args: "[task]", description: "plan mode: research read-only, then a plan" },
   { group: "Commands", name: "auto", args: "[task]", description: "auto mode: everything except dangerous actions" },
   { group: "Commands", name: "compact", args: "[focus]", description: "summarize the conversation to free context" },
+  { group: "Commands", name: "status", description: "what every agent is doing: step, tool, checklist (works while agents run)" },
   { group: "Commands", name: "context", description: "context usage" },
   { group: "Commands", name: "clear", description: "start a new conversation" },
   { group: "Commands", name: "skills", description: "available skills" },
@@ -661,6 +663,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         break;
       case "keys":
         line(shortcutsText());
+        break;
+      case "status":
+        line(renderStatus(agent.board));
         break;
       case "clear":
         agent.reset();
