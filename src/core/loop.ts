@@ -96,6 +96,8 @@ export class Agent {
   /** called whenever the mode changes (UI redraws its prompt) */
   onModeChange?: (mode: Mode) => void;
   sessionAllowed = new Set<string>();
+  /** a subagent follows its parent's mode, so shift+tab during its run applies to it too */
+  parent: Agent | undefined;
   private persist: boolean;
   private systemPrompt: string;
   private lastCatalog = "";
@@ -477,7 +479,8 @@ export class Agent {
   /** true, or the message returned to the model when the call is refused */
   private async permit(tool: Tool, args: Record<string, unknown>, ui: AgentUI): Promise<true | string> {
     const readOnly = this.subagent?.readOnly;
-    const decision = decide(readOnly ? "plan" : this.mode, tool, args, this.cwd);
+    const root = this.parent ?? this;
+    const decision = decide(readOnly ? "plan" : root.mode, tool, args, this.cwd);
     if (decision.action === "allow") return true;
     if (decision.action === "deny") {
       return readOnly ? `${tool.name} is not allowed: this subagent is read-only.` : decision.reason;
@@ -485,7 +488,12 @@ export class Agent {
     const risky = decision.reason !== undefined;
     if (!risky && this.sessionAllowed.has(tool.name)) return true;
     const answer = await ui.confirm(tool, args, decision.reason);
-    if (answer === "always" && !risky) this.sessionAllowed.add(tool.name);
+    if (answer === "always" && !risky) {
+      // "always" for one edit means edits in general (Edit, Write, …): switch to accept-edits instead of
+      // asking again for every other edit tool
+      if (tool.kind === "edit" && root.mode === "ask") root.setMode("acceptEdits");
+      else this.sessionAllowed.add(tool.name);
+    }
     return answer === "no" ? "The user denied this tool call. Ask them how to proceed or try a different approach." : true;
   }
 
@@ -510,6 +518,7 @@ export class Agent {
       changes: this.changes,
     });
     child.sessionAllowed = this.sessionAllowed;
+    child.parent = this.parent ?? this;
     const childUi = ui.child?.(`${def.name}${description ? `: ${description}` : ""}`) ?? ui;
     let answer: string;
     try {

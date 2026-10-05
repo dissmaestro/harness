@@ -417,7 +417,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     } else body.push(oneLine(JSON.stringify(args), w));
     const title = tool.name + (reason ? ` · ${reason}` : "");
     line(box(body, title, reason ? c.red : c.yellow).replace(/^/gm, pad));
-    const hint = reason ? "[y]es · [a]lways for this tool · [N]o" : "[Y]es · [a]lways for this tool · [n]o";
+    const always = reason ? "" : tool.kind === "edit" && agent.mode === "ask" ? "[a]ll edits this session · " : "[a]lways for this tool · ";
+    const hint = reason ? `[y]es · [N]o ${c.dim(`(${reason}: asked every time)`)}` : `[Y]es · ${always}[n]o`;
     const a = await answer(pad + c.yellow(`Allow? ${hint} › `));
     if (running?.signal.aborted) return "no";
     return confirmAnswer(a, !!reason);

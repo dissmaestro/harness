@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { symlinkSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
-import { decide, isProtectedPath, isReadOnlyCommand } from "../src/core/modes.ts";
+import { decide, insideProject, isProtectedPath, isReadOnlyCommand } from "../src/core/modes.ts";
 import { Edit, Write } from "../src/tools/core/files.ts";
+import { tempDir } from "./helpers.ts";
 
 test("read-only commands stay read-only", () => {
   for (const cmd of [
@@ -103,4 +106,14 @@ test("protected paths ask even in acceptEdits and auto", () => {
     assert.equal(decide(mode, Edit, { file_path: "CLAUDE.md" }, cwd).action, "allow");
   }
   assert.equal(decide("yolo", Edit, { file_path: ".git/config" }, cwd).action, "allow");
+});
+
+test("a project opened through a symlink: the real path is inside the project too", () => {
+  const real = tempDir();
+  const link = join(tempDir(), "proj");
+  symlinkSync(real, link);
+  assert.equal(insideProject(link, join(real, "src", "new.ts")), true);
+  assert.equal(insideProject(real, join(link, "a.ts")), true);
+  assert.equal(insideProject(link, join(tempDir(), "x.ts")), false);
+  assert.equal(insideProject(link, "../outside.ts"), false);
 });

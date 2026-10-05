@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Tool } from "../types.ts";
 
 /**
@@ -209,11 +210,29 @@ export function isDangerousCommand(command: string): boolean {
   return DANGEROUS.some((re) => re.test(command));
 }
 
-function insideProject(cwd: string, path: unknown): boolean {
+/** The path with symlinks resolved; for a file that doesn't exist yet, its nearest existing parent is resolved. */
+function realPath(p: string): string {
+  let tail = "";
+  for (let dir = p; ; dir = dirname(dir)) {
+    try {
+      return join(realpathSync(dir), tail);
+    } catch {
+      if (dirname(dir) === dir) return p;
+      tail = join(dir.slice(dirname(dir).length + 1), tail);
+    }
+  }
+}
+
+function within(root: string, abs: string): boolean {
+  const rel = relative(root, abs);
+  return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+export function insideProject(cwd: string, path: unknown): boolean {
   if (typeof path !== "string") return true;
   const abs = isAbsolute(path) ? path : resolve(cwd, path);
-  const rel = relative(cwd, abs);
-  return !rel.startsWith("..") && !isAbsolute(rel);
+  // the project may be opened through a symlink (~/proj → /data/proj) while the model writes the other spelling
+  return within(cwd, abs) || within(realPath(cwd), realPath(abs));
 }
 
 /** Directories whose files configure git, the agent, editors or hooks: they can run code later. */

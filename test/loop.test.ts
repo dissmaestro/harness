@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Agent } from "../src/core/loop.ts";
@@ -151,6 +151,35 @@ test("UseTool: calls a loaded deferred tool, arguments may be a JSON string; ref
     assert.match(tools[0], /not loaded yet/);
     assert.match(tools[1], /Call them with UseTool/);
     assert.equal(tools[2], "hi max");
+  } finally {
+    srv.close();
+  }
+});
+
+test('"always" for one edit allows every edit tool: the mode switches to accept edits', async () => {
+  const call = (id: string, name: string, args: object) => [
+    { choices: [{ delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] } }] },
+  ];
+  const srv = await fakeServer([
+    call("c1", "Write", { file_path: "a.txt", content: "one\n" }),
+    call("c2", "Read", { file_path: "a.txt" }),
+    call("c3", "Edit", { file_path: "a.txt", old_string: "one", new_string: "two" }),
+    call("c4", "Write", { file_path: "b.txt", content: "b\n" }),
+    text("done"),
+  ]);
+  try {
+    const home = tempDir();
+    const cwd = tempDir();
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home });
+    const asked: string[] = [];
+    const ui = { ...silentUI([]), confirm: async (tool: { name: string }) => (asked.push(tool.name), "always" as const) };
+    await agent.send("go", ui, new AbortController().signal);
+    assert.deepEqual(asked, ["Write"]);
+    assert.equal(agent.mode, "acceptEdits");
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "two\n");
+    assert.equal(readFileSync(join(cwd, "b.txt"), "utf8"), "b\n");
   } finally {
     srv.close();
   }
