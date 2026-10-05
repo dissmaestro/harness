@@ -47,6 +47,10 @@ export interface Settings {
   hooks: HooksConfig;
   mcpServers: Record<string, McpServerConfig>;
   subagents: SubagentsConfig;
+  /** what a click on a file path opens: auto, vscode, cursor, codium, zed, idea, file, or a template with {path} {line} {col} */
+  editor?: string;
+  /** clickable file paths (OSC 8 terminal hyperlinks) */
+  hyperlinks?: boolean;
 }
 
 const DEFAULTS: Settings = {

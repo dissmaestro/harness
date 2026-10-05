@@ -1,12 +1,12 @@
 import { lineHighlighter } from "./highlight.ts";
-import { c } from "./render.ts";
+import { c, linkPaths, urlLink } from "./render.ts";
 
-function inline(s: string): string {
-  return s
+function inline(s: string, cwd?: string): string {
+  return (cwd ? linkPaths(s, cwd) : s)
     .replace(/`([^`]+)`/g, (_m, code: string) => c.cyan(code))
     .replace(/\*\*([^*]+)\*\*/g, (_m, t: string) => c.bold(t))
     .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\*)/g, (_m, pre: string, t: string) => pre + c.italic(t))
-    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, (_m, t: string, url: string) => `${c.blue(t)} ${c.dim(`(${url})`)}`);
+    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, (_m, t: string, url: string) => `${c.blue(urlLink(t, url))} ${c.dim(`(${url})`)}`);
 }
 
 /** Renders Markdown line by line as it streams in (a line is printed once its newline arrives). */
@@ -16,9 +16,12 @@ export class MarkdownStream {
   /** highlighter for the current fenced block (its language from the fence) */
   private hl: (line: string) => string = (x) => x;
   private write: (s: string) => void;
+  /** paths of existing files under this directory become clickable */
+  private cwd: string | undefined;
 
-  constructor(write: (s: string) => void) {
+  constructor(write: (s: string) => void, cwd?: string) {
     this.write = write;
+    this.cwd = cwd;
   }
 
   push(text: string) {
@@ -53,16 +56,16 @@ export class MarkdownStream {
     }
     if (this.inCode) return c.gray("│ ") + this.hl(line);
     const h = line.match(/^(#{1,6})\s+(.*)/);
-    if (h) return h[1].length <= 2 ? c.bold(c.magenta(inline(h[2]))) : c.bold(inline(h[2]));
+    if (h) return h[1].length <= 2 ? c.bold(c.magenta(inline(h[2], this.cwd))) : c.bold(inline(h[2], this.cwd));
     if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) return c.gray("─".repeat(40));
     const bullet = line.match(/^(\s*)[-*+]\s+(.*)/);
-    if (bullet) return `${bullet[1]}${c.gray("•")} ${inline(bullet[2])}`;
+    if (bullet) return `${bullet[1]}${c.gray("•")} ${inline(bullet[2], this.cwd)}`;
     const quote = line.match(/^\s*>\s?(.*)/);
-    if (quote) return c.gray("│ ") + c.italic(inline(quote[1]));
+    if (quote) return c.gray("│ ") + c.italic(inline(quote[1], this.cwd));
     if (/^\s*\|.*\|\s*$/.test(line)) {
       if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) return c.gray(line);
-      return line.replace(/\|/g, c.gray("│")).replace(/[^│]+/g, (cell) => inline(cell));
+      return line.replace(/\|/g, c.gray("│")).replace(/[^│]+/g, (cell) => inline(cell, this.cwd));
     }
-    return inline(line);
+    return inline(line, this.cwd);
   }
 }

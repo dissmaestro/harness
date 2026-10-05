@@ -30,7 +30,7 @@ npm link                                                          # команд
 
 ```bash
 packaging/arch/build.sh            # собирает из текущей копии, без сети; --nocheck пропускает тесты
-sudo pacman -U packaging/arch/local-agent-0.3.1-1-any.pkg.tar.zst
+sudo pacman -U packaging/arch/local-agent-0.4.0-1-any.pkg.tar.zst
 agent --version
 ```
 

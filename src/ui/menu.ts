@@ -12,7 +12,7 @@ export function truncateAnsi(s: string, width: number): string {
   let out = "";
   let n = 0;
   for (let i = 0; i < s.length; ) {
-    const esc = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
+    const esc = /^(?:\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\))/.exec(s.slice(i));
     if (esc) {
       out += esc[0];
       i += esc[0].length;
@@ -20,6 +20,7 @@ export function truncateAnsi(s: string, width: number): string {
     }
     const ch = String.fromCodePoint(s.codePointAt(i)!);
     if (n >= width) {
+      if (s.includes("\x1b]8;")) out += "\x1b]8;;\x1b\\"; // close a link cut in the middle
       out += s.includes("\x1b[") ? "\x1b[0m" : "";
       return out;
     }

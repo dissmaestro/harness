@@ -7,7 +7,7 @@ import { loadSettings } from "./core/settings.ts";
 import type { Registry } from "./registry/registry.ts";
 import { loadRegistry } from "./registry/load.ts";
 import { runHeadless } from "./ui/headless.ts";
-import { c } from "./ui/render.ts";
+import { c, configureLinks } from "./ui/render.ts";
 import { runRepl } from "./ui/repl.ts";
 import { killAllProcesses, VERSION } from "./util.ts";
 
@@ -126,6 +126,7 @@ async function main() {
   if (values.model) settings.model = values.model;
   if (values["base-url"]) settings.baseUrl = values["base-url"];
   if (values["api-key"]) settings.apiKey = values["api-key"];
+  configureLinks(settings);
   if (values["accept-edits"]) settings.permissionMode = "acceptEdits";
   if (values.plan) settings.permissionMode = "plan";
   if (values.auto) settings.permissionMode = "auto";

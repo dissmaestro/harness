@@ -1,4 +1,6 @@
-import { isAbsolute, relative } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { hostname } from "node:os";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import type { Mode } from "../core/modes.ts";
 import { oneLine } from "../util.ts";
 
@@ -28,7 +30,88 @@ export const c = {
   inverse: wrap(7, 27),
 };
 
-export const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+/** Removes colors and OSC 8 hyperlinks (for measuring visible width). */
+export const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+
+// ---------- clickable file paths (OSC 8) ----------
+
+/** URL templates with {path} (absolute, URI-encoded), {line} and {col}. */
+export const EDITOR_URLS: Record<string, string> = {
+  vscode: "vscode://file{path}:{line}:{col}",
+  cursor: "cursor://file{path}:{line}:{col}",
+  codium: "vscodium://file{path}:{line}:{col}",
+  zed: "zed://file{path}:{line}:{col}",
+  idea: "idea://open?file={path}&line={line}&column={col}",
+  file: "file://{host}{path}",
+};
+
+let linkTemplate: string | undefined;
+
+function onPath(cmd: string, env: NodeJS.ProcessEnv): boolean {
+  return (env.PATH ?? "").split(delimiter).some((d) => d && existsSync(join(d, cmd)));
+}
+
+/**
+ * Turns links on or off. `editor`: auto (VS Code, Cursor, VSCodium or Zed if installed, else file://),
+ * one of EDITOR_URLS, or a custom template. Off when output isn't a terminal, TERM=dumb,
+ * hyperlinks: false or AGENT_HYPERLINKS=0.
+ */
+export function configureLinks(opts: { editor?: string; hyperlinks?: boolean }, env: NodeJS.ProcessEnv = process.env, tty = !!process.stdout.isTTY) {
+  linkTemplate = undefined;
+  if (opts.hyperlinks === false || env.AGENT_HYPERLINKS === "0" || env.TERM === "dumb" || !color || !(tty || env.AGENT_HYPERLINKS === "1")) return;
+  let editor = opts.editor || "auto";
+  if (editor === "auto") {
+    editor = onPath("code", env) ? "vscode" : onPath("cursor", env) ? "cursor" : onPath("codium", env) ? "codium" : onPath("zed", env) || onPath("zeditor", env) ? "zed" : "file";
+  }
+  linkTemplate = EDITOR_URLS[editor] ?? (editor.includes("{path}") ? editor : EDITOR_URLS.file);
+}
+
+export const linksEnabled = () => linkTemplate !== undefined;
+
+/** `text` that opens `absPath` (at `line`) when clicked; plain text when links are off. */
+export function fileLink(text: string, absPath: string, line?: number, col?: number): string {
+  if (!linkTemplate) return text;
+  const url = linkTemplate
+    .replace("{path}", encodeURI(absPath).replace(/[?#]/g, encodeURIComponent))
+    .replace("{host}", hostname())
+    .replace("{line}", String(line ?? 1))
+    .replace("{col}", String(col ?? 1));
+  return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+}
+
+/** A link to any URL (http links in the model's text). */
+export function urlLink(text: string, url: string): string {
+  return linkTemplate ? `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\` : text;
+}
+
+const existsCache = new Map<string, boolean>();
+function isFile(abs: string): boolean {
+  let v = existsCache.get(abs);
+  if (v === undefined) {
+    try {
+      v = statSync(abs).isFile();
+    } catch {
+      v = false;
+    }
+    if (existsCache.size > 5000) existsCache.clear();
+    existsCache.set(abs, v);
+  }
+  return v;
+}
+
+// a path with an extension (src/ui/app.ts, ./a.py, /etc/hosts.conf), optionally :line[:col]
+const PATH_IN_TEXT = /(?<![\w/.@-])((?:~|\.{1,2})?\/?(?:[\w.@-]+\/)*[\w@-][\w.@-]*\.[A-Za-z0-9]{1,10})(?::(\d+)(?::(\d+))?)?(?![\w/])/g;
+
+/** Wraps paths of existing files in plain text (no ANSI codes in it yet) into links. */
+export function linkPaths(text: string, cwd: string): string {
+  if (!linkTemplate || !/[./]/.test(text)) return text;
+  let checks = 0;
+  return text.replace(PATH_IN_TEXT, (m, p: string, line?: string, col?: string) => {
+    if (++checks > 50 || /^\d+(\.\d+)+$/.test(p)) return m; // 1.2.3 is a version, not a file
+    const abs = p.startsWith("~/") ? join(process.env.HOME ?? "", p.slice(2)) : resolve(cwd, p);
+    return isFile(abs) ? fileLink(m, abs, line ? Number(line) : undefined, col ? Number(col) : undefined) : m;
+  });
+}
 
 export const MODE_STYLE: Record<Mode, (s: string) => string> = {
   ask: c.green,

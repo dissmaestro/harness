@@ -19,7 +19,7 @@ import { Footer, MutableOutput, columnAfter } from "./footer.ts";
 import { activitySummary, renderStatus } from "./status.ts";
 import { formatDuration } from "../core/activity.ts";
 import { page } from "./pager.ts";
-import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
+import { MODE_STYLE, argSummary, box, c, contextLabel, diffLines, fileLink, formatTokens, resultSummary, shortPath, stripAnsi } from "./render.ts";
 
 /** Built-in commands: the /help text and the / menu. */
 export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })[] = [
@@ -103,6 +103,15 @@ export function wrapText(text: string, width: number): string[] {
     if (line.trim()) out.push(line.trimEnd());
   }
   return out;
+}
+
+/** 1-based number of the first line that differs (where the editor should open after an edit). */
+export function firstChangedLine(before: string, after: string): number {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return Math.min(i, b.length - 1) + 1;
 }
 
 /** "/home/x/a.py fails" is a prompt that starts with a path, not a command. */
@@ -201,7 +210,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     atLineStart = s.endsWith("\n");
     footer.draw();
   };
-  const md = new MarkdownStream(raw);
+  const md = new MarkdownStream(raw, agent.cwd);
+  /** a path relative to the project, clickable (opens the editor at `line`) */
+  const pathLink = (abs: string, line?: number, text = shortPath(abs, agent.cwd)) => fileLink(text, resolve(agent.cwd, abs), line);
   const endText = () => {
     md.flush();
     if (!atLineStart) raw("\n");
@@ -418,17 +429,17 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       return;
     }
     if (change && EDIT_TOOLS.has(name)) {
-      const p = shortPath(change.path, agent.cwd);
+      const p = change.after === null ? shortPath(change.path, agent.cwd) : pathLink(change.path, firstChangedLine(change.before ?? "", change.after));
       const verb = change.before === null ? "Created" : change.after === null ? "Deleted" : name === "Write" ? "Wrote" : "Edited";
       const { added, removed } = diffStat(change.before ?? "", change.after ?? "");
-      line(lead + c.dim(`${verb} ${p} `) + c.green(`+${added}`) + " " + c.red(`-${removed}`));
+      line(lead + c.dim(`${verb} `) + c.dim(p) + " " + c.green(`+${added}`) + " " + c.red(`-${removed}`));
       const w = width() - stripAnsi(more).length;
       for (const l of renderDiff(change.path, change.before, change.after, { maxLines: pad ? 12 : 40, width: w })) line(more + l);
       return;
     }
     switch (name) {
       case "Edit":
-        line(lead + c.dim(`Edited ${shortPath(String(args.file_path), agent.cwd)}`));
+        line(lead + c.dim("Edited ") + c.dim(pathLink(String(args.file_path))));
         for (const l of diffLines(String(args.old_string ?? ""), String(args.new_string ?? ""), 10)) line(more + l);
         return;
       case "Read": {
@@ -466,10 +477,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     const body: string[] = [];
     if (tool.name === "Bash") body.push(...String(args.command).split("\n").slice(0, 8).map((l) => c.bold(l.slice(0, w))));
     else if (tool.name === "Edit") {
-      body.push(c.bold(shortPath(String(args.file_path), agent.cwd)));
+      body.push(c.bold(pathLink(String(args.file_path))));
       body.push(...diffLines(String(args.old_string), String(args.new_string), 8));
     } else if (tool.name === "Write") {
-      body.push(c.bold(shortPath(String(args.file_path), agent.cwd)) + c.dim(` (${String(args.content ?? "").split("\n").length} lines)`));
+      body.push(c.bold(pathLink(String(args.file_path))) + c.dim(` (${String(args.content ?? "").split("\n").length} lines)`));
     } else body.push(oneLine(JSON.stringify(args), w));
     const title = tool.name + (reason ? ` · ${reason}` : "");
     line(box(body, title, reason ? c.red : c.yellow).replace(/^/gm, pad));
@@ -519,8 +530,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
         const list = started.get(name) ?? [];
         list.push(args);
         started.set(name, list);
-        const summary = argSummary(name, args, agent.cwd);
-        line(pad + c.cyan("● ") + c.bold(name) + (summary ? c.dim(`(${summary})`) : ""));
+        let summary = argSummary(name, args, agent.cwd);
+        const file = typeof args.file_path === "string" ? args.file_path : typeof args.path === "string" && name !== "Grep" && name !== "Glob" ? args.path : undefined;
+        if (file && summary) summary = pathLink(file, typeof args.offset === "number" ? args.offset : undefined, summary);
+        line(pad + c.cyan("● ") + c.bold(name) + (summary ? c.dim("(") + c.dim(summary) + c.dim(")") : ""));
       },
       onToolEnd: (name, result, isError, change?: WriteChange) => renderToolEnd(pad, name, result, isError, started.get(name)?.shift() ?? {}, change),
       onInfo: (m) => line(pad + c.yellow(`  ${m}`)),
@@ -587,7 +600,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     const nw = Math.max(...names.map((n) => n.length));
     files.forEach((f, i) => {
       const stat = `${c.green(`+${f.added}`.padStart(5))} ${c.red(`-${f.removed}`.padEnd(5))}`;
-      line(`  ${STATUS_PAINT[f.status](f.status)} ${names[i].padEnd(nw)}  ${stat} ${c.dim(`${f.tools.join(",")}×${f.writes}`)}`);
+      const name = f.status === "D" ? names[i] : pathLink(f.path, undefined, names[i]);
+      line(`  ${STATUS_PAINT[f.status](f.status)} ${name}${" ".repeat(nw - names[i].length)}  ${stat} ${c.dim(`${f.tools.join(",")}×${f.writes}`)}`);
     });
   };
 
@@ -671,7 +685,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   /** Markdown rendered into a box (side answers, plans). */
   const mdBox = (text: string, title: string, paint: (s: string) => string) => {
     const rendered: string[] = [];
-    const r = new MarkdownStream((x) => rendered.push(...x.replace(/\n$/, "").split("\n")));
+    const r = new MarkdownStream((x) => rendered.push(...x.replace(/\n$/, "").split("\n")), agent.cwd);
     r.push(wrapText(text, width() - 6).join("\n") + "\n");
     return box(rendered, title, paint);
   };
@@ -756,7 +770,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     const [, cmd, args] = input.slice(1).match(/^(\S*)\s*([\s\S]*)$/)!;
     if (!input.startsWith("/") || (isPathLike(input) && !reg.commands.has(cmd) && !reg.skills.has(cmd))) {
       const { text, attached } = expandMentions(input, agent.cwd);
-      for (const a of attached) line(c.gray("  ⎿ ") + c.dim(`@${a.path} (${a.summary})`));
+      for (const a of attached) line(c.gray("  ⎿ ") + c.dim("@") + c.dim(pathLink(a.path, undefined, a.path)) + c.dim(` (${a.summary})`));
       await ask(text);
       continue;
     }
