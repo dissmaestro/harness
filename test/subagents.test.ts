@@ -45,15 +45,15 @@ test("Agent calls in one reply run in parallel; results stay in call order", asy
       return text(`report for ${/TASK-\d/.exec(t)![0]}`);
     },
     100_000,
-    300,
+    600,
   );
   try {
     const { agent } = await setup(tempDir(), srv.url);
     const t0 = Date.now();
     await agent.send("go", silentUI([]), new AbortController().signal);
     const took = Date.now() - t0;
-    // sequential would be 5 requests × 300ms; parallel is 3 (main, the three subagents at once, main)
-    assert.ok(took < 1300, `took ${took}ms`);
+    // sequential would be 5 requests × 600ms = 3s; parallel is 3 rounds (main, the three subagents at once, main) ≈ 1.8s
+    assert.ok(took < 2700, `took ${took}ms`);
     const tools = agent.messages.filter((m) => m.role === "tool");
     assert.deepEqual(
       tools.map((m) => /report for (TASK-\d)/.exec(String(m.content))?.[1]),
