@@ -191,6 +191,17 @@ export class Agent {
     this.pendingReminders.push("This conversation was restored from a saved session. Files may have changed since: re-read them before editing.");
   }
 
+  /**
+   * Continues in a new session that starts as a copy of this one (the original stays as it is and can be
+   * resumed with /resume or agent --resume).
+   */
+  fork(label?: string): { from: string | undefined; to: string } {
+    const from = this.journal?.id;
+    this.journal = new SessionJournal(this.cwd, this.settings.model, this.home, undefined, { parent: from, label });
+    this.journal.reset(this.messages);
+    return { from, to: this.journal.id };
+  }
+
   /** Queues a note for the model; it is sent with the next user message or tool result. */
   notify(text: string) {
     this.pendingReminders.push(text);

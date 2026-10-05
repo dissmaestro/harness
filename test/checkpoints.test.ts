@@ -74,3 +74,29 @@ test("read-only commands and reads take no checkpoint; checkpoints can be turned
     srv.close();
   }
 });
+
+test("fork: a new session that starts as a copy; the original is kept and listed as its parent", async () => {
+  const srv = await fakeServer([text("first answer"), text("on the fork")]);
+  try {
+    const cwd = tempDir();
+    const home = tempDir();
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home, persist: true });
+    await agent.send("start", silentUI([]), new AbortController().signal);
+    const original = agent.journal!.id;
+    const { from, to } = agent.fork("try b");
+    assert.equal(from, original);
+    await agent.send("continue on the fork", silentUI([]), new AbortController().signal);
+    const { listSessions, readSession } = await import("../src/core/sessions.ts");
+    const all = listSessions(cwd, home);
+    const fork = all.find((s) => s.id === to)!;
+    const orig = all.find((s) => s.id === original)!;
+    assert.equal(fork.parent, original);
+    assert.equal(fork.label, "try b");
+    assert.equal(readSession(orig.file).filter((m) => m.role === "user").length, 1, "the original is untouched");
+    assert.equal(readSession(fork.file).filter((m) => m.role === "user").length, 2);
+  } finally {
+    srv.close();
+  }
+});

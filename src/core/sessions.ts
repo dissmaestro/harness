@@ -14,6 +14,10 @@ export interface SessionMeta {
   cwd: string;
   model: string;
   started: string;
+  /** the session this one was forked from (/fork) */
+  parent?: string;
+  /** the fork's name */
+  label?: string;
 }
 
 export interface SessionInfo {
@@ -23,6 +27,8 @@ export interface SessionInfo {
   /** first user request, for listings */
   title: string;
   messages: number;
+  parent?: string;
+  label?: string;
 }
 
 export function sessionsDir(cwd: string, home = homedir()): string {
@@ -38,10 +44,10 @@ export class SessionJournal {
   /** the file is created with the first message, so sessions that never got one leave nothing behind */
   private meta: SessionMeta | undefined;
 
-  constructor(cwd: string, model: string, home = homedir(), id = newId()) {
+  constructor(cwd: string, model: string, home = homedir(), id = newId(), extra: Pick<SessionMeta, "parent" | "label"> = {}) {
     this.id = id;
     this.file = join(sessionsDir(cwd, home), `${id}.jsonl`);
-    if (!existsSync(this.file)) this.meta = { id, cwd, model, started: new Date().toISOString() };
+    if (!existsSync(this.file)) this.meta = { id, cwd, model, started: new Date().toISOString(), ...extra };
   }
 
   private write(record: object) {
@@ -64,6 +70,17 @@ export class SessionJournal {
 
   reset(messages: Message[]) {
     this.write({ type: "reset", messages });
+  }
+}
+
+/** The meta record (first line) of a journal. */
+export function readSessionMeta(file: string): Partial<SessionMeta> {
+  try {
+    const first = readFileSync(file, "utf8").split("\n", 1)[0];
+    const rec = JSON.parse(first);
+    return rec?.type === "meta" ? rec : {};
+  } catch {
+    return {};
   }
 }
 
@@ -96,7 +113,8 @@ export function listSessions(cwd: string, home = homedir()): SessionInfo[] {
       const firstUser = messages.find((m) => m.role === "user");
       if (!firstUser) continue;
       const title = String(firstUser.content).split("<system-reminder>")[0].replace(/\s+/g, " ").trim().slice(0, 80);
-      out.push({ id: name.slice(0, -6), file, updated: statSync(file).mtime, title, messages: messages.length });
+      const meta = readSessionMeta(file);
+      out.push({ id: name.slice(0, -6), file, updated: statSync(file).mtime, title, messages: messages.length, parent: meta.parent, label: meta.label });
     } catch {}
   }
   return out.sort((a, b) => b.updated.getTime() - a.updated.getTime());

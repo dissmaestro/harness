@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { readText, type ChangeTracker } from "../core/changes.ts";
 import type { Agent, AgentUI, Approval, PlanDecision } from "../core/loop.ts";
 import { MODES, MODE_CYCLE, nextMode, parseMode, type Mode } from "../core/modes.ts";
+import { findSession, listSessions } from "../core/sessions.ts";
 import { expandCommand } from "../registry/loaders/skills.ts";
 import { skillPrompt } from "../tools/Skill.ts";
 import type { Tool } from "../types.ts";
@@ -33,6 +34,9 @@ export const BUILTIN_COMMANDS: (CommandInfo & { group: "Commands" | "Changes" })
   { group: "Commands", name: "status", description: "what every agent is doing: step, tool, checklist (works while agents run)" },
   { group: "Commands", name: "context", description: "context usage" },
   { group: "Commands", name: "clear", description: "start a new conversation" },
+  { group: "Commands", name: "fork", args: "[#n] [name]", description: "continue in a copy of this conversation (from checkpoint #n's turn); the original is kept" },
+  { group: "Commands", name: "tree", description: "saved conversations of this folder and their forks" },
+  { group: "Commands", name: "resume", args: "<id>", description: "switch to a saved conversation (see /tree)" },
   { group: "Commands", name: "skills", description: "available skills" },
   { group: "Commands", name: "agents", description: "available subagents" },
   { group: "Commands", name: "tools", description: "core and deferred tools" },
@@ -736,6 +740,43 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     }
   };
 
+  const forkCmd = async (arg: string) => {
+    const m = /^#?(\d+)?\s*([\s\S]*)$/.exec(arg)!;
+    const n = m[1] ? Number(m[1]) : undefined;
+    const label = m[2].trim() || undefined;
+    if (n !== undefined && !agent.checkpoints?.list.some((cp) => cp.n === n)) return line(c.red(`  No checkpoint #${n}. /restore lists them.`));
+    const { from, to } = agent.fork(label);
+    if (n !== undefined) {
+      const { cp } = await agent.restore(n, "chat");
+      prefill = cp.turn;
+      line(c.dim(`  The fork starts before “${oneLine(cp.turn, 60)}” (files are unchanged; /restore ${n} files puts them back too).`));
+    }
+    line(c.green(`  Forked${label ? ` “${label}”` : ""}: now in ${to}.`) + (from ? c.dim(` The original is kept: /resume ${from}`) : ""));
+  };
+
+  const showTree = () => {
+    const all = listSessions(agent.cwd, agent.home);
+    if (!all.length) return line(c.dim("  No saved conversations in this folder yet."));
+    const ids = new Set(all.map((s) => s.id));
+    const kids = new Map<string, typeof all>();
+    for (const s of all) if (s.parent && ids.has(s.parent)) kids.set(s.parent, [...(kids.get(s.parent) ?? []), s]);
+    const current = agent.journal?.id;
+    const out: string[] = [];
+    /** last: undefined for a top-level conversation, else whether it is its parent's last fork */
+    const walk = (s: (typeof all)[number], pad: string, last?: boolean) => {
+      const name = s.label ? c.magenta(`[${s.label}] `) : "";
+      const here = s.id === current ? c.green(" ← current") : "";
+      const branch = last === undefined ? "" : c.gray(last ? "└ " : "├ ");
+      out.push(`${pad}${branch}${c.cyan(s.id)}  ${name}${oneLine(s.title, 50)} ${c.dim(`(${s.messages} msgs, ${s.updated.toLocaleString()})`)}${here}`);
+      const ch = (kids.get(s.id) ?? []).sort((a, b) => a.id.localeCompare(b.id));
+      const next = pad + (last === undefined ? "" : last ? "  " : c.gray("│ "));
+      ch.forEach((k, i) => walk(k, next, i === ch.length - 1));
+    };
+    for (const s of all.filter((x) => !x.parent || !ids.has(x.parent)).slice(0, 20)) walk(s, "  ");
+    line(out.join("\n"));
+    line(c.dim("  /resume <id> switches to one; /fork makes a branch of the current one."));
+  };
+
   const verify = async (fix: boolean) => {
     const cfg = agent.settings.verify;
     if (!cfg?.test && !cfg?.lint) {
@@ -871,6 +912,22 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       case "restore":
         await restoreCmd(args.trim());
         break;
+      case "fork":
+        await forkCmd(args.trim());
+        break;
+      case "tree":
+        showTree();
+        break;
+      case "resume": {
+        const s = args.trim() ? findSession(agent.cwd, args.trim(), agent.home) : undefined;
+        if (!s) {
+          line(c.dim(args.trim() ? `  No saved conversation "${args.trim()}". /tree lists them.` : "  /resume <id>: /tree lists the conversations."));
+          break;
+        }
+        agent.loadSession(s.file, s.id);
+        line(c.green(`  Switched to “${s.title}”${s.label ? ` [${s.label}]` : ""} (${s.messages} messages).`));
+        break;
+      }
       case "clear":
         agent.reset();
         line(c.dim("  New conversation."));
