@@ -6,6 +6,22 @@ CLI-агент для программирования на локальных �
 
 Зависимостей нет. Нужен Node ≥ 23.6 (он запускает TypeScript напрямую) или Bun, а также `rg` (ripgrep).
 
+## Установка на Arch: скачать, собрать, запустить
+
+```bash
+git clone https://github.com/dissmaestro/harness.git
+cd harness
+./install.sh                     # зависимости → сборка пакета (makepkg + тесты) → pacman -U → ~/.agent/settings.json
+cd ~/мой-проект && agent
+```
+
+- Запускать от своего пользователя: `sudo` спросят только для `pacman`.
+- Сервер и модель для нового `settings.json`: `./install.sh --server http://host:8081/v1 --model qwen3.6`.
+  Модель за псевдонимом (LiteLLM `smart` и т. п.): добавь `--profile qwen3.6`; ключ: `--api-key …`.
+  Уже существующий `~/.agent/settings.json` не трогается.
+- Только собрать: `./install.sh --no-install`; без тестов: `--nocheck`; посмотреть шаги: `DRY_RUN=1 ./install.sh`.
+- Обновить: `git pull && ./install.sh`. Удалить: `sudo pacman -R local-agent` (настройки в `~/.agent` остаются).
+
 ## Запуск
 
 ```bash
