@@ -163,3 +163,34 @@ test("argument coercion and validation", () => {
   assert.match(validateArgs(schema, {})!, /missing required parameter "n"/);
   assert.match(validateArgs(schema, { n: 1, mode: "c" })!, /one of/);
 });
+
+test("text tool calls: Gemma 4, Gemma 3 tool_code, Mistral, Llama, DeepSeek, bare JSON", () => {
+  const known = new Set(["Read", "Bash", "Edit"]);
+  const g4 = extractTextToolCalls('Reading.<|tool_call>call:Read{file_path:<|"|>src/a, b.ts<|"|>,offset:10,limit:5}<tool_call|>', known);
+  assert.deepEqual(g4.calls, [{ name: "Read", arguments: { file_path: "src/a, b.ts", offset: 10, limit: 5 } }]);
+  assert.equal(g4.rest, "Reading.");
+  const g4nested = extractTextToolCalls('<|tool_call>call:Edit{file_path:<|"|>x<|"|>,old_string:<|"|>a{b}<|"|>,new_string:<|"|>c "q"<|"|>,replace_all:false}<turn|>', known);
+  assert.deepEqual(g4nested.calls[0].arguments, { file_path: "x", old_string: "a{b}", new_string: 'c "q"', replace_all: false });
+  const g4bare = extractTextToolCalls('call:Bash{command:<|"|>ls<|"|>}', known);
+  assert.deepEqual(g4bare.calls, [{ name: "Bash", arguments: { command: "ls" } }]);
+  assert.equal(extractTextToolCalls("call:nope{a:1}", known).calls.length, 0, "bare call: only for known tools");
+
+  const g3 = extractTextToolCalls('```tool_code\nprint(default_api.Bash(command="npm test", timeout=60))\n```', known);
+  assert.deepEqual(g3.calls, [{ name: "Bash", arguments: { command: "npm test", timeout: 60 } }]);
+
+  const mistral = extractTextToolCalls('[TOOL_CALLS][{"name": "Read", "arguments": {"file_path": "a"}}, {"name": "Bash", "arguments": {"command": "ls"}}]', known);
+  assert.deepEqual(mistral.calls.map((c) => c.name), ["Read", "Bash"]);
+  const mistral2 = extractTextToolCalls('[TOOL_CALLS]Read[ARGS]{"file_path": "a"}', known);
+  assert.deepEqual(mistral2.calls, [{ name: "Read", arguments: { file_path: "a" } }]);
+
+  const llama = extractTextToolCalls('<|python_tag|>{"name": "Bash", "parameters": {"command": "pwd"}}<|eom_id|>', known);
+  assert.deepEqual(llama.calls, [{ name: "Bash", arguments: { command: "pwd" } }]);
+
+  const ds = extractTextToolCalls('<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>Read\n```json\n{"file_path": "a"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>', known);
+  assert.deepEqual(ds.calls, [{ name: "Read", arguments: { file_path: "a" } }]);
+  assert.equal(ds.rest, "");
+
+  const bare = extractTextToolCalls('{"name": "Read", "arguments": {"file_path": "a"}}', known);
+  assert.equal(bare.calls.length, 1);
+  assert.equal(extractTextToolCalls('{"name": "Bob", "age": 3}', known).calls.length, 0, "plain JSON data is not a call");
+});
