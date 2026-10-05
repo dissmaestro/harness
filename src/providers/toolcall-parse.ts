@@ -287,6 +287,9 @@ export function extractTextToolCalls(text: string, knownNames: Set<string>): { c
   return { calls, rest: rest.trim() };
 }
 
+/** The text without thinking: <think>…</think> blocks, and everything before a lone </think> (Qwen's template opens the tag itself). */
 export function stripThinking(text: string): string {
-  return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const t = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const end = t.lastIndexOf("</think>");
+  return (end >= 0 ? t.slice(end + "</think>".length) : t).trim();
 }

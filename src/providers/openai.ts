@@ -1,3 +1,4 @@
+import { resolveRequest } from "../core/profile.ts";
 import type { Settings } from "../core/settings.ts";
 import type { Message, Tool, ToolCall } from "../types.ts";
 
@@ -8,6 +9,8 @@ export interface ChatRequest {
   onText?: (text: string) => void;
   onReasoning?: (text: string) => void;
   maxTokens?: number;
+  /** whose request this is: "main", "compact", "aside" or a subagent type (settings.roles) */
+  role?: string;
 }
 
 export interface Usage {
@@ -26,6 +29,8 @@ export interface Timings {
 
 export interface ChatResult {
   content: string;
+  /** the model's thinking: the server's reasoning field, or the <think> part of the content */
+  reasoning: string;
   toolCalls: ToolCall[];
   usage?: Usage;
   timings?: Timings;
@@ -120,17 +125,52 @@ export async function chat(settings: Settings, req: ChatRequest & { onRetry?: (m
 }
 
 /** One streaming request. Throws ChatError (retryable or not) with the partial content streamed so far. */
+/**
+ * The messages as sent: an assistant message's reasoning goes back to the server (as reasoning_content
+ * for llama.cpp/older vLLM and reasoning for vLLM ≥ 0.20) only where the profile preserves thinking:
+ * "turn" = after the user's latest real message, "all" = everywhere. Elsewhere it is dropped.
+ */
+export function wireMessages(messages: Message[], preserve: "turn" | "all" | "off"): unknown[] {
+  let lastTask = -1;
+  if (preserve === "turn") {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === "user" && !String(m.content).startsWith("<system-reminder>")) {
+        lastTask = i;
+        break;
+      }
+    }
+  }
+  return messages.map((m, i) => {
+    if (m.role !== "assistant" || m.reasoning === undefined) return m;
+    const { reasoning, ...rest } = m;
+    const keep = reasoning && (preserve === "all" || (preserve === "turn" && i > lastTask));
+    return keep ? { ...rest, reasoning_content: reasoning, reasoning } : rest;
+  });
+}
+
+/** Splits "<think>…</think>answer" (or "…</think>answer" when the template opened the tag itself). */
+export function splitThinking(content: string): { text: string; thinking: string } {
+  const end = content.lastIndexOf("</think>");
+  if (end < 0) return { text: content, thinking: "" };
+  const thinking = content.slice(0, end).replace(/<\/?think>/g, "").trim();
+  return { text: content.slice(end + "</think>".length).trim(), thinking };
+}
+
 async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig): Promise<ChatResult> {
+  const r = resolveRequest(settings, req.role);
   const body: Record<string, unknown> = {
-    model: settings.model,
-    messages: req.messages,
+    ...r.extraBody,
+    model: r.model,
+    messages: wireMessages(req.messages, r.preserve),
     // OpenAI rejects an empty tools array
     ...(req.tools.length && { tools: req.tools.map(toolSpec) }),
     stream: true,
     stream_options: { include_usage: true },
   };
-  if (settings.temperature !== undefined) body.temperature = settings.temperature;
-  if (req.maxTokens ?? settings.maxTokens) body.max_tokens = req.maxTokens ?? settings.maxTokens;
+  for (const [k, v] of Object.entries(r.sampling)) if (v !== undefined) body[k] = v;
+  if (r.chatTemplateKwargs) body.chat_template_kwargs = { ...(r.extraBody?.chat_template_kwargs as object), ...r.chatTemplateKwargs };
+  if (req.maxTokens ?? r.maxTokens) body.max_tokens = req.maxTokens ?? r.maxTokens;
 
   // Our own watchdog: the first byte may take long (prompt processing), but a stream must not stall.
   const watchdog = new AbortController();
@@ -160,12 +200,12 @@ async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig):
 
   let res: Response;
   try {
-    res = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    res = await fetch(`${r.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       signal,
       headers: {
         "content-type": "application/json",
-        ...(settings.apiKey ? { authorization: `Bearer ${settings.apiKey}` } : {}),
+        ...(r.apiKey ? { authorization: `Bearer ${r.apiKey}` } : {}),
       },
       body: JSON.stringify(body),
     });
@@ -185,6 +225,7 @@ async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig):
   }
 
   let content = "";
+  let reasoningText = "";
   const calls: ToolCall[] = [];
   let usage: Usage | undefined;
   let timings: Timings | undefined;
@@ -212,7 +253,10 @@ async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig):
     if (!choice) return;
     const delta = choice.delta ?? {};
     const reasoning = delta.reasoning_content ?? delta.reasoning;
-    if (reasoning) req.onReasoning?.(reasoning);
+    if (reasoning) {
+      reasoningText += reasoning;
+      req.onReasoning?.(reasoning);
+    }
     if (delta.content) {
       content += delta.content;
       req.onText?.(delta.content);
@@ -251,7 +295,8 @@ async function chatOnce(settings: Settings, req: ChatRequest, cfg: RetryConfig):
   const toolCalls = calls
     .filter((c) => c && c.function.name)
     .map((c, i) => ({ ...c, id: c.id || `call_${Date.now()}_${i}` }));
-  return { content, toolCalls, usage, timings, finishReason };
+  const inline = splitThinking(content);
+  return { content, reasoning: reasoningText || inline.thinking, toolCalls, usage, timings, finishReason };
 }
 
 export function isContextOverflow(e: unknown): boolean {

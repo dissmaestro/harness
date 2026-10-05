@@ -18,7 +18,7 @@ export interface ToolCall {
 
 export type Message =
   | { role: "system" | "user"; content: string }
-  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
+  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[]; reasoning?: string }
   | { role: "tool"; tool_call_id: string; content: string };
 
 /** read: runs without asking; edit: auto-approved in acceptEdits mode; exec: always asks (unless yolo). */

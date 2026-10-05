@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { HooksConfig } from "../hooks/hooks.ts";
 import { parseMode, type Mode } from "./modes.ts";
 import type { DiagnosticsConfig } from "./diagnostics.ts";
+import type { RoleConfig, Sampling, ThinkingConfig } from "./profile.ts";
 import type { VerifyConfig } from "./verify.ts";
 
 export interface McpServerConfig {
@@ -53,6 +54,16 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** model family preset: auto (from the model name), qwen3.6, qwen3, none */
+  profile?: string;
+  /** sampling parameters sent with every request (top_k/min_p are understood by vLLM, llama.cpp, SGLang) */
+  sampling?: Sampling;
+  /** chat_template_kwargs enable_thinking / preserve_thinking, and replaying reasoning in the history */
+  thinking?: ThinkingConfig;
+  /** per-role overrides: "compact", "aside", or a subagent type → {model, baseUrl, apiKey, thinking, sampling, maxTokens} */
+  roles?: Record<string, RoleConfig>;
+  /** merged into every request body as is (server-specific options) */
+  extraBody?: Record<string, unknown>;
   /** a map of the repository's main symbols sent at the start of each conversation; false = off */
   repoMap?: false | { tokens?: number; subagentTokens?: number };
   /** errors of an edited file (language server or syntax check) appended to the Edit/Write result; false = off */

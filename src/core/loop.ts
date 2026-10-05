@@ -12,6 +12,7 @@ import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { type Checkpoint, Checkpoints } from "./checkpoints.ts";
 import { Diagnostics } from "./diagnostics.ts";
+import { resolveRequest } from "./profile.ts";
 import { buildRepoMap } from "./repomap.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
@@ -244,6 +245,11 @@ export class Agent {
     return this.diagnosticsStore;
   }
 
+  /** settings.roles key for this agent's requests: "main" or the subagent type */
+  get role(): string {
+    return this.subagent?.name ?? "main";
+  }
+
   // ---------- repository map ----------
 
   /** The repository map for this agent ("" when off, not a code project, or a subagent that doesn't read code). */
@@ -390,6 +396,7 @@ export class Agent {
         },
       ],
       tools: [],
+      role: "aside",
       signal,
       maxTokens: 1024,
     });
@@ -408,7 +415,9 @@ export class Agent {
   contextUsed(): number {
     const base = this.lastUsage ? this.lastUsage.prompt_tokens + this.lastUsage.completion_tokens : 0;
     const from = this.lastUsage ? this.usageAtMessages : 0;
-    const chars = this.messages.slice(from).reduce((n, m) => n + (m.content?.length ?? 0) + JSON.stringify((m as any).tool_calls ?? "").length, 0);
+    const chars = this.messages
+      .slice(from)
+      .reduce((n, m) => n + (m.content?.length ?? 0) + JSON.stringify((m as any).tool_calls ?? "").length + ((m as any).reasoning?.length ?? 0), 0);
     return base + Math.ceil(chars / 3.5);
   }
 
@@ -477,6 +486,7 @@ export class Agent {
         return await chat(this.settings, {
           messages: this.messages,
           tools: this.modelTools,
+          role: this.role,
           signal,
           onText: (t) => {
             ui.onWaiting?.(false);
@@ -550,7 +560,14 @@ export class Agent {
         }
       }
       if (finalStep) calls = []; // tools are no longer allowed: whatever it wrote is the answer
-      this.push({ role: "assistant", content: text || (calls.length ? null : ""), ...(calls.length && { tool_calls: calls }) });
+      // the thinking is kept with the message when the profile sends it back (Qwen3.6 preserve_thinking)
+      const keepReasoning = res.reasoning && resolveRequest(this.settings, this.role).preserve !== "off";
+      this.push({
+        role: "assistant",
+        content: text || (calls.length ? null : ""),
+        ...(calls.length && { tool_calls: calls }),
+        ...(keepReasoning && { reasoning: res.reasoning }),
+      });
 
       if (!calls.length) {
         answer += (answer && text ? "\n" : "") + text;
@@ -967,6 +984,7 @@ export class Agent {
       chat(this.settings, {
         messages: [...msgs, { role: "user", content: reminder(COMPACT_REQUEST(opts.focus) + extra) }],
         tools: this.modelTools,
+        role: "compact",
         signal,
         maxTokens: 4096,
         onRetry: (m) => ui.onInfo(m),
