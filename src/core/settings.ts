@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { HooksConfig } from "../hooks/hooks.ts";
 import { parseMode, type Mode } from "./modes.ts";
+import type { DiagnosticsConfig } from "./diagnostics.ts";
 import type { VerifyConfig } from "./verify.ts";
 
 export interface McpServerConfig {
@@ -52,6 +53,8 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** errors of an edited file (language server or syntax check) appended to the Edit/Write result; false = off */
+  diagnostics?: boolean | DiagnosticsConfig;
   /** snapshot the project in a shadow git repo before every changing tool call (/restore) */
   checkpoints?: boolean;
   /** lint/test commands run after a turn that changed files; failures go back to the model */

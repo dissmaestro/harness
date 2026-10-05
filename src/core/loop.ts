@@ -11,6 +11,7 @@ import { oneLine, resolvePath, saveFullOutput, truncateMiddle } from "../util.ts
 import { Activity, ActivityBoard, type Todo } from "./activity.ts";
 import { ChangeTracker } from "./changes.ts";
 import { type Checkpoint, Checkpoints } from "./checkpoints.ts";
+import { Diagnostics } from "./diagnostics.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
 import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
@@ -125,6 +126,7 @@ export class Agent {
   /** shadow-git snapshots before changing tool calls (the main agent's; subagents in the same folder share it) */
   private checkpointStore: Checkpoints | undefined;
   private checkpointWarned = false;
+  private diagnosticsStore: Diagnostics | undefined;
   /** the current turn of the main agent: its message and the history length before it */
   private turn = { prompt: "", history: 0 };
   /** what every agent of this session is doing (shared with subagents) */
@@ -227,6 +229,16 @@ export class Agent {
       else if (was === "plan") this.pendingReminders.push(PLAN_MODE_OFF(MODES[mode].label));
     }
     this.onModeChange?.(mode);
+  }
+
+  /** Diagnostics after edits (shared with subagents: one set of language servers per session). */
+  get diagnostics(): Diagnostics | undefined {
+    const root = this.parent ?? this;
+    if (root !== this) return root.diagnostics;
+    const cfg = this.settings.diagnostics;
+    if (cfg === false) return undefined;
+    this.diagnosticsStore ??= new Diagnostics(this.cwd, typeof cfg === "object" ? cfg : {});
+    return this.diagnosticsStore;
   }
 
   // ---------- checkpoints ----------
@@ -673,6 +685,11 @@ export class Agent {
       isError = true;
     }
     const change = file ? this.changes.afterWrite(file) : undefined;
+    // the file's errors right in the edit result, so the model fixes them in its next step
+    if (file && !isError && typeof change?.after === "string" && this.diagnostics) {
+      this.activity.update({ tool: { name: "diagnostics", summary: this.board.toolSummary(name, args), since: Date.now() } });
+      out += await this.diagnostics.afterEdit(file, change.after, this.cwd).catch(() => "");
+    }
     const post = await this.hook(ui, "PostToolUse", { tool_name: name, tool_input: args, tool_response: out }, name, signal);
     if (post.blocked) out += `\n\n${reminder(`PostToolUse hook feedback:\n${post.feedback}`)}`;
     // A formatter hook rewrites the file right after our write: accept that as the model's latest view

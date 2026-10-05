@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { Agent } from "./core/loop.ts";
 import { parseMode } from "./core/modes.ts";
 import { findSession, listSessions } from "./core/sessions.ts";
+import { stopAllLsp } from "./core/lsp.ts";
 import { loadSettings } from "./core/settings.ts";
 import type { Registry } from "./registry/registry.ts";
 import { loadRegistry } from "./registry/load.ts";
@@ -42,6 +43,7 @@ let registry: Registry | undefined;
 let interactive = false;
 
 function cleanup() {
+  stopAllLsp();
   killAllProcesses();
   registry?.dispose();
 }
