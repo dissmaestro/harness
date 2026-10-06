@@ -299,3 +299,18 @@ test("a garbled tool name from the server is reduced to its first word", async (
     srv.close();
   }
 });
+
+test("settings.json may have comments; the full example file loads with its values", async () => {
+  const { copyFileSync, mkdirSync } = await import("node:fs");
+  const home = tempDir();
+  mkdirSync(join(home, ".agent"));
+  copyFileSync(new URL("../examples/settings.full.jsonc", import.meta.url), join(home, ".agent", "settings.json"));
+  const s = loadSettings(tempDir(), home);
+  assert.equal(s.baseUrl, "http://192.168.0.3:8081/v1");
+  assert.equal(s.model, "qwen3.6");
+  assert.equal(s.maxSteps, 60);
+  assert.deepEqual(s.roles, { compact: { thinking: false }, aside: { thinking: false } });
+  assert.deepEqual(s.subagents, { delegate: "prefer", parallel: 3, worktree: "auto" });
+  assert.deepEqual(s.readOnlyCommands, []);
+  assert.equal(s.webSearch.provider, "bing");
+});

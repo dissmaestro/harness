@@ -117,3 +117,76 @@ test("a project opened through a symlink: the real path is inside the project to
   assert.equal(insideProject(link, join(tempDir(), "x.ts")), false);
   assert.equal(insideProject(link, "../outside.ts"), false);
 });
+
+test("more read-only commands: viewers, sed -n, awk, cd, xargs/for around read-only commands, version checks", () => {
+  for (const cmd of [
+    "cd src && ls -la",
+    "sed -n '1,80p' src/app.ts",
+    "sed -n '/export/p' a.ts | head",
+    "awk '{print $1}' access.log | sort | uniq -c",
+    "awk -F: '$3 > 1000 {print $1}' /etc/passwd",
+    "find . -name '*.ts' | xargs wc -l",
+    "find src -type f -print0 | xargs -0 -n 50 grep -l TODO",
+    "for f in src/*.ts; do wc -l $f; done",
+    "while read l; do echo $l; done < list.txt",
+    "if [ -f package.json ]; then cat package.json; fi",
+    "nl -ba main.go | sed -n '10,20p'",
+    "node --version && npm ls --depth=0",
+    "go version",
+    "pip list",
+    "docker ps -a",
+    "systemctl status llama-server",
+    "journalctl -u llama-server -n 50",
+    "timeout 5 cat big.log",
+    "env LC_ALL=C sort a.txt",
+    "xxd -l 64 file.bin",
+    "pacman -Qi nodejs",
+  ]) {
+    assert.ok(isReadOnlyCommand(cmd), cmd);
+  }
+});
+
+test("still not read-only: writing sed/awk, xargs/timeout/env around writers, risky builtins and subcommands", () => {
+  for (const cmd of [
+    "sed -i 's/a/b/' x.ts",
+    "sed -ni 's/a/b/p' x.ts",
+    "sed -n 's/a/b/w out.txt' x.ts",
+    "sed '1e rm x' a",
+    "awk '{print > \"out\"}' a",
+    "awk 'BEGIN{system(\"rm x\")}'",
+    "awk -f prog.awk a",
+    "find . | xargs rm",
+    "xargs sh -c 'rm x'",
+    "timeout 5 rm x",
+    "env PAGER=evil git log",
+    "export GIT_EXTERNAL_DIFF=x; git diff",
+    "node -e 'require(\"fs\").rmSync(\"x\")'",
+    "npm install",
+    "npm config set registry x",
+    "pip install x",
+    "go list ./...",
+    "cargo check",
+    "docker rm -f x",
+    "kubectl delete pod x",
+    "systemctl restart llama-server",
+    "journalctl --vacuum-time=1d",
+    "pacman -Syu",
+    "pacman -R nodejs",
+    "make -n",
+    "for f in *.ts; do rm $f; done",
+  ]) {
+    assert.ok(!isReadOnlyCommand(cmd), cmd);
+  }
+});
+
+test("readOnlyCommands from settings: user prefixes count as read-only", () => {
+  assert.ok(!isReadOnlyCommand("docker compose ps"));
+  assert.ok(isReadOnlyCommand("docker compose ps", ["docker compose ps"]));
+  assert.ok(isReadOnlyCommand("cd x && make lint-check", ["make lint-check"]));
+  assert.ok(!isReadOnlyCommand("make lint-check-and-fix", ["make lint-check"]), "a prefix matches whole words only");
+  const ro = { name: "Bash", kind: "exec" } as never;
+  assert.equal(decide("plan", ro, { command: "docker compose ps" }, "/", ["docker compose ps"]).action, "allow");
+  const denied = decide("plan", ro, { command: "npm install" }, "/");
+  assert.equal(denied.action, "deny");
+  assert.match((denied as { reason: string }).reason, /^Not run: `npm install` may change something.*Read-only commands work/);
+});

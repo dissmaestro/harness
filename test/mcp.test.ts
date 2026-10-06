@@ -63,7 +63,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (msg.method === "notifications/cancelled") appendFileSync(log, "cancelled " + msg.params.requestId + "\\n");
   if (msg.id === undefined) return;
   if (msg.method === "initialize") send({ id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "h", version: "1" } } });
-  else if (msg.method === "tools/call" && msg.params.name === "hang") {}
+  else if (msg.method === "tools/call" && msg.params.name === "hang") appendFileSync(log, "hanging " + msg.id + "\\n");
   else if (msg.method === "tools/call") send({ id: msg.id, result: { content: [{ type: "text", text: "ok" }] } });
 });
 `;
@@ -89,7 +89,9 @@ test("MCP: abort cancels the call; a timeout restarts the server", async () => {
   try {
     const ac = new AbortController();
     const call = client.callTool("hang", {}, ac.signal);
-    setTimeout(() => ac.abort(), 100);
+    // abort once the server really has the call (under load it may still be starting after 100ms)
+    for (let i = 0; i < 200 && !/hanging/.test(existsSync(log) ? readFileSync(log, "utf8") : ""); i++) await new Promise((r) => setTimeout(r, 20));
+    ac.abort();
     await assert.rejects(call, /aborted/);
     assert.equal(await client.callTool("other", {}), "ok", "same server still works");
     assert.match(readFileSync(log, "utf8"), /cancelled \d+/);

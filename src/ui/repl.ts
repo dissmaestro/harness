@@ -468,6 +468,11 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     lastResult = { name, result };
     const lead = pad + c.gray("  ⎿ ");
     const more = pad + "    ";
+    if (isError && result.startsWith("Not run:")) {
+      // a refused call (read-only subagent, plan mode, "don't change anything") is not a failure: one quiet line
+      line(lead + c.dim("⊘ " + oneLine(result.slice("Not run:".length).split(/(?<=\.)\s/)[0], 110)));
+      return;
+    }
     if (isError) {
       line(lead + c.red(resultSummary(result, 3).replace(/\n/g, "\n" + more)));
       return;

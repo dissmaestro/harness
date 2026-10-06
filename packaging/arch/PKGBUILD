@@ -2,7 +2,7 @@
 # Build from the local checkout (no network): ./build.sh   (extra args go to makepkg, e.g. --nocheck)
 
 pkgname=local-agent
-pkgver=0.6.5
+pkgver=0.6.6
 pkgrel=1
 pkgdesc="CLI coding agent for local models (llama.cpp, Ollama, vLLM) with lazy skills and deferred tools"
 arch=(any)
@@ -33,4 +33,5 @@ package() {
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 examples/settings.full.jsonc "$pkgdir/usr/share/doc/$pkgname/settings.full.jsonc"
 }

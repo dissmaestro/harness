@@ -58,7 +58,7 @@ test("a read-only message: edits are refused even in auto mode; a question gets 
     assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "hello\n");
     assert.match(String(srv.requests[0].messages.at(-1).content), /NOT to change anything/);
     const denied = agent.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
-    assert.match(denied[1], /Write was not run: the user asked not to change anything/);
+    assert.match(denied[1], /Not run: Write would change something, and the user asked not to change anything/);
     assert.ok(log.some((l) => /read-only for this message/.test(l)));
 
     await agent.send("почему так?", silentUI([]), new AbortController().signal);

@@ -48,4 +48,4 @@ export const QUESTION_REMINDER =
   "if a fix seems useful, describe it and offer it instead.";
 
 export const READONLY_DENIED = (tool: string) =>
-  `${tool} was not run: the user asked not to change anything in this message (only look and answer). Answer with what you found; describe any change you would make instead of making it.`;
+  `Not run: ${tool} would change something, and the user asked not to change anything in this message (only look and answer). Answer with what you found; describe any change you would make instead of making it.`;

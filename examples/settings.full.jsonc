@@ -1,0 +1,85 @@
+// ~/.agent/settings.json — all settings, with defaults and explanations.
+// Comments and trailing commas are allowed. A project can override any of this in <project>/.agent/settings.json.
+// Copy only what you want to change: everything left out keeps its default.
+{
+  // ───────────── model server ─────────────
+  "baseUrl": "http://192.168.0.3:8081/v1", // OpenAI-compatible endpoint: llama-server, vLLM, LiteLLM, Ollama (…:11434/v1), LM Studio
+  "model": "qwen3.6",                      // model name as the server knows it (LiteLLM alias, e.g. "smart")
+  // "apiKey": "sk-…",                     // if the server was started with --api-key (or set AGENT_API_KEY)
+  "contextWindow": 65536,                  // tokens; read from llama-server's /props when left out (LiteLLM can't tell: set it)
+  // "maxTokens": 8192,                    // max tokens per answer; the server's default when left out
+
+  // ───────────── model profile (Qwen) ─────────────
+  "profile": "auto",                       // auto (from the model name) | qwen3.6 | qwen3 | none; a model behind an alias needs "qwen3.6"
+  // Below: what the qwen3.6 profile already sends. Set them only to change something.
+  // "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0 },
+  // "temperature": 0.6,                   // shortcut for sampling.temperature
+  "thinking": {
+    // "enabled": true,                    // chat_template_kwargs.enable_thinking
+    "preserve": "turn"                     // send earlier reasoning back: "turn" (current task), "all", "off"
+  },
+  // Per role: "main", "compact" (history summaries), "aside" (questions while agents work), or a subagent type.
+  // Fields: model, baseUrl, apiKey, thinking (false = faster, no reasoning), sampling, maxTokens.
+  "roles": {
+    "compact": { "thinking": false },
+    "aside": { "thinking": false }
+    // "explore": { "thinking": false },                                     // faster code search, a bit less careful
+    // "explore": { "model": "qwen3.6-small", "baseUrl": "http://…/v1" }     // a second, smaller model
+  },
+  // "extraBody": {},                      // merged into every request as is (server-specific options)
+
+  // ───────────── permissions ─────────────
+  "permissionMode": "ask",                 // starting mode: ask | acceptEdits | plan | auto | yolo (shift+tab switches)
+  // Commands that only read and may run without asking, also in read-only subagents (prefix, whole words).
+  // ls, cat, head, grep, rg, find, sed -n, awk, git log/diff/show, version checks… are read-only already.
+  "readOnlyCommands": [
+    // "docker compose ps",
+    // "make lint-check",
+    // "kubectl get"
+  ],
+
+  // ───────────── steps and context ─────────────
+  "maxSteps": 60,                          // model steps per message, then "Continue for 60 more?" (--max-steps overrides)
+  "subagentMaxSteps": 30,                  // per subagent (no question, they report at the limit)
+  "autoCompact": 0.8,                      // summarize the history when the context is this full; 0 = never
+  "retry": { "maxSeconds": 300, "firstByteSeconds": 900, "idleSeconds": 180 }, // waiting for a restarting/slow server
+
+  // ───────────── subagents ─────────────
+  "subagents": {
+    "delegate": "prefer",                  // prefer: the main agent hands searches and subtasks to subagents; normal: only when it decides
+    "parallel": 3,                         // subagents running at the same time
+    "worktree": "auto"                     // auto: writing subagents in parallel get their own git worktree; always; off
+  },
+
+  // ───────────── safety net and checks ─────────────
+  "checkpoints": true,                     // snapshot before every change (Bash included) for /restore
+  "diagnostics": {                         // errors of an edited file in the edit result; false = off
+    "lsp": true,                           // language servers when installed (typescript-language-server, pyright, gopls…)
+    "timeoutMs": 4000
+    // "servers": { ".vue": { "command": "vue-language-server", "args": ["--stdio"] } }
+  },
+  "verify": {                              // after a turn that changed files; failures go back to the model
+    // "lint": "npm run lint",
+    // "test": "npm test",
+    "auto": true,
+    "maxFixes": 3,
+    "timeoutSeconds": 300
+  },
+  "repoMap": { "tokens": 1500, "subagentTokens": 1000 }, // repository map at the start of a conversation; false = off
+
+  // ───────────── terminal ─────────────
+  "promptFrame": true,                     // rules above and below the input line
+  "editor": "auto",                        // what a click on a path opens: auto | vscode | cursor | codium | zed | idea | file | "myed://{path}:{line}"
+  "hyperlinks": true,                      // clickable paths (OSC 8); false if the terminal shows garbage
+
+  // ───────────── web, skills, integrations ─────────────
+  "webSearch": { "provider": "bing" },     // bing (no key) | { "provider": "searxng", "url": "http://…" } | { "provider": "brave", "apiKey": "BSA…" }
+  "builtins": true,                        // built-in skills, subagents, web tools
+  "claudeCompat": true,                    // also read .claude/skills, .claude/commands, .claude/agents, CLAUDE.md
+  "hooks": {
+    // "PostToolUse": [{ "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "./scripts/format.sh" }] }]
+  },
+  "mcpServers": {
+    // "github": { "command": "github-mcp-server", "args": ["stdio"], "env": { "GITHUB_TOKEN": "…" } }
+  }
+}

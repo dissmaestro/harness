@@ -37,13 +37,37 @@ export function nextMode(m: Mode): Mode {
   return MODE_CYCLE[(i + 1) % MODE_CYCLE.length];
 }
 
-// No wrappers that run another command (env, xargs, nohup, timeout, nice…): they would bypass the list.
+// Wrappers that run another command (xargs, timeout, nice, env) are allowed only when that command is read-only too.
 const READONLY_COMMANDS = new Set([
   "ls", "cat", "head", "tail", "wc", "rg", "grep", "egrep", "fgrep", "find", "fd", "tree", "pwd", "echo", "printf",
   "file", "stat", "du", "df", "which", "whereis", "type", "printenv", "uname", "date", "whoami", "id",
   "sort", "uniq", "cut", "tr", "diff", "cmp", "md5sum", "sha256sum", "basename", "dirname", "realpath",
-  "readlink", "less", "jq", "true", "test", "[",
+  "readlink", "less", "jq", "true", "false", "test", "[", "[[",
+  // more text and file viewers
+  "nl", "column", "more", "tac", "rev", "fold", "expand", "unexpand", "comm", "join", "paste", "seq", "fmt",
+  "od", "xxd", "hexdump", "strings", "sha1sum", "sha512sum", "b2sum", "cksum", "bat", "batcat", "eza", "exa",
+  "ag", "ack", "yq", "tokei", "cloc", "lsof", "ps", "pgrep", "free", "uptime", "groups", "locale",
+  "nproc", "lscpu", "lsblk", "nm", "objdump", "readelf", "size", "getent", "tty", "sleep", "wait",
+  // shell builtins that only move around or read (not export/set/alias: a variable like GIT_EXTERNAL_DIFF runs programs)
+  "cd", "pushd", "popd", "read", "shift", "dirs", "hash", "command",
 ]);
+/** commands that only read when called like this: name → allowed first arguments ("*" = any) */
+const READONLY_SUBCOMMANDS: Record<string, string[]> = {
+  node: ["--version", "-v"], python: ["--version", "-V"], python3: ["--version", "-V"], ruby: ["--version", "-v"],
+  php: ["--version", "-v"], java: ["-version", "--version"], javac: ["-version", "--version"], deno: ["--version", "info"], bun: ["--version"],
+  gcc: ["--version"], "g++": ["--version"], clang: ["--version"], rustc: ["--version", "-V"], tsc: ["--version", "-v"],
+  go: ["version", "env", "doc"], cargo: ["--version", "-V", "tree", "metadata", "search"],
+  npm: ["--version", "-v", "ls", "list", "view", "info", "outdated", "why", "explain", "root", "prefix", "bin"],
+  pnpm: ["--version", "-v", "ls", "list", "why", "outdated", "root"], yarn: ["--version", "-v", "list", "info", "why", "outdated"],
+  pip: ["--version", "list", "show", "freeze", "check"], pip3: ["--version", "list", "show", "freeze", "check"], uv: ["--version", "tree"],
+  docker: ["ps", "images", "logs", "inspect", "version", "info", "stats"], podman: ["ps", "images", "logs", "inspect", "version", "info"],
+  kubectl: ["get", "describe", "logs", "version", "top", "explain", "api-resources"], helm: ["list", "status", "get", "version", "show"],
+  systemctl: ["status", "list-units", "list-unit-files", "is-active", "is-enabled", "is-failed", "show", "cat"],
+  journalctl: ["*"], pacman: ["-Q", "-Qi", "-Ql", "-Qo", "-Ss", "-Si", "-Qs"],
+};
+/** shell keywords: the command follows them ("do wc -l $f"), or the segment runs nothing by itself ("done") */
+const KEYWORDS_BEFORE = new Set(["do", "then", "else", "elif", "if", "while", "until", "!", "{", "time"]);
+const KEYWORDS_ALONE = new Set(["done", "fi", "esac", "}", ";;"]);
 const READONLY_GIT = new Set(["status", "log", "diff", "show", "branch", "blame", "ls-files", "rev-parse", "remote", "describe", "shortlog", "tag", "grep"]);
 
 /** Flags that make an otherwise read-only command write files or run other programs. */
@@ -55,7 +79,16 @@ const FORBIDDEN_FLAGS: Record<string, RegExp> = {
   tree: /^(-o|--output)/,
   date: /^(-s|--set)/,
   file: /^-[^-]*C/,
+  sed: /^(-[^-]*i|--in-place)/, // -i edits in place
+  journalctl: /^--(vacuum|rotate|flush|sync|relinquish|setup-keys|update-catalog)/,
+  pacman: /^-[^-]*[SRUD](?![si])/, // -S -R -U -D change the system; -Ss/-Si only search
+  less: /^(-o|--log-file|-O|--LOG-FILE)/,
 };
+
+/** sed scripts with w/W (write a file) or e (run a command) */
+const SED_WRITES = /(^|[;\n{}]|\d|\$|\/)\s*[wWe](\s|$)|\/[gpI0-9]*[wWe]\s/;
+/** awk programs that write files, run commands or read from them */
+const AWK_WRITES = /system\s*\(|getline|\|&?\s*"|print[^;{}]*>|printf[^;{}]*>|fflush|close\s*\(/;
 
 /** Variables a read-only command may be prefixed with; others (GIT_*, PAGER, LD_PRELOAD…) can run code. */
 const SAFE_ENV = /^(LC_\w+|LANG|LANGUAGE|TZ|NO_COLOR|COLUMNS|TERM)=/;
@@ -166,28 +199,63 @@ function isReadOnlyGit(words: string[]): boolean {
   return true;
 }
 
-/** True when every part of a shell command only reads (used in plan mode and read-only subagents). */
-export function isReadOnlyCommand(command: string): boolean {
+/** One simple command (already split into words) only reads. `extra` are user-allowed command prefixes. */
+function simpleReadOnly(words: string[], extra: string[]): boolean {
+  while (words.length && KEYWORDS_BEFORE.has(words[0])) words = words.slice(1);
+  if (!words.length || (words.length === 1 && KEYWORDS_ALONE.has(words[0]))) return true;
+  if (words[0] === "for" || words[0] === "case" || words[0] === "select") return true; // the header runs nothing
+  while (words.length && /^\w+=/.test(words[0])) {
+    if (!SAFE_ENV.test(words[0])) return false;
+    words = words.slice(1);
+  }
+  if (!words.length) return true;
+  const line = words.join(" ");
+  if (extra.some((p) => line === p || line.startsWith(p + " "))) return true;
+  const [cmd, ...args] = words;
+  const name = cmd.split("/").pop()!;
+  if (name === "git") return isReadOnlyGit(words);
+  // wrappers: fine when the command they run is read-only
+  if (name === "env") {
+    let i = 0;
+    while (i < args.length && (args[i].startsWith("-") || /^\w+=/.test(args[i]))) {
+      if (/^\w+=/.test(args[i]) && !SAFE_ENV.test(args[i])) return false;
+      i++;
+    }
+    return i >= args.length || simpleReadOnly(args.slice(i), extra);
+  }
+  if (name === "xargs") {
+    let i = 0;
+    while (i < args.length && args[i].startsWith("-")) i += /^-[nIdPLsE]$|^--(max-args|replace|delimiter|max-procs|max-lines)$/.test(args[i]) ? 2 : 1;
+    return i >= args.length ? true : simpleReadOnly(args.slice(i), extra); // bare xargs runs echo
+  }
+  if (name === "timeout" || name === "nice" || name === "stdbuf" || name === "ionice") {
+    let i = 0;
+    while (i < args.length && args[i].startsWith("-")) i += /^-[nkscio]$/.test(args[i]) ? 2 : 1;
+    if (name === "timeout" && i < args.length) i++; // the duration
+    return i < args.length && simpleReadOnly(args.slice(i), extra);
+  }
+  const sub = READONLY_SUBCOMMANDS[name];
+  if (sub) {
+    const first = args.find((a) => name === "pacman" || !a.startsWith("-") || sub.includes(a));
+    if (!(sub.includes("*") || (first !== undefined && sub.includes(first)))) return false;
+  } else if (!READONLY_COMMANDS.has(name) && name !== "sed" && name !== "awk" && name !== "gawk" && name !== "mawk") return false;
+  const forbidden = FORBIDDEN_FLAGS[name];
+  if (forbidden && args.some((a) => forbidden.test(a))) return false;
+  if (name === "uniq" && args.filter((a) => !a.startsWith("-")).length > 1) return false; // uniq IN OUT writes OUT
+  if (name === "sed" && args.some((a) => !a.startsWith("-") && SED_WRITES.test(a))) return false;
+  if ((name === "awk" || name === "gawk" || name === "mawk") && args.some((a) => AWK_WRITES.test(a) || /^-[^-]*f/.test(a))) return false;
+  if ((name === "command" || name === "hash") && args.some((a) => !a.startsWith("-"))) return args[0] === "-v" || args[0] === "-V";
+  return true;
+}
+
+/**
+ * True when every part of a shell command only reads (used to run it without asking, in plan mode and in
+ * read-only subagents). `extra`: command prefixes the user declared read-only ("readOnlyCommands").
+ */
+export function isReadOnlyCommand(command: string, extra: string[] = []): boolean {
   const cmds = splitCommands(command);
   if (!cmds) return false;
-  for (let words of cmds) {
-    while (words.length && /^\w+=/.test(words[0])) {
-      if (!SAFE_ENV.test(words[0])) return false;
-      words = words.slice(1);
-    }
-    if (!words.length) continue;
-    const [cmd, ...args] = words;
-    if (cmd === "git") {
-      if (!isReadOnlyGit(words)) return false;
-      continue;
-    }
-    if (cmd === "env" && !args.length) continue; // bare env lists variables; with arguments it runs a command
-    if (!READONLY_COMMANDS.has(cmd)) return false;
-    const forbidden = FORBIDDEN_FLAGS[cmd];
-    if (forbidden && args.some((a) => forbidden.test(a))) return false;
-    if (cmd === "uniq" && args.filter((a) => !a.startsWith("-")).length > 1) return false; // uniq IN OUT writes OUT
-  }
-  return true;
+  return cmds.every((words) => simpleReadOnly(words, extra));
 }
 
 const DANGEROUS: RegExp[] = [
@@ -248,15 +316,21 @@ export function isProtectedPath(cwd: string, path: unknown): boolean {
 export type Decision = { action: "allow" } | { action: "ask"; reason?: string } | { action: "deny"; reason: string };
 
 /** Pure permission policy. The agent adds per-session "always allow" answers on top. */
-export function decide(mode: Mode, tool: Tool, args: Record<string, unknown>, cwd: string): Decision {
+export const READONLY_HINT =
+  "Read-only commands work: ls, cat, head, tail, grep, rg, find, tree, wc, sed -n, awk (no output files), cut, sort, diff, " +
+  "git log/diff/show/status, cd, xargs or for-loops around those, and version checks (node --version, npm ls, pip list…). " +
+  "Prefer the Read, Grep and Glob tools.";
+
+export function decide(mode: Mode, tool: Tool, args: Record<string, unknown>, cwd: string, extraReadOnly: string[] = []): Decision {
   if (tool.kind === "read") return { action: "allow" };
   if (mode === "plan") {
-    if (tool.name === "Bash" && isReadOnlyCommand(String(args.command ?? ""))) return { action: "allow" };
+    if (tool.name === "Bash" && isReadOnlyCommand(String(args.command ?? ""), extraReadOnly)) return { action: "allow" };
     return {
       action: "deny",
       reason:
-        `${tool.name} is not allowed in plan mode: only read-only tools work. ` +
-        "Finish researching, then present your plan with ExitPlanMode.",
+        tool.name === "Bash"
+          ? `Not run: \`${oneLineCmd(args.command)}\` may change something, and only read-only commands work in plan mode. ${READONLY_HINT}`
+          : `Not run: ${tool.name} is not allowed in plan mode, only read-only tools work. Finish researching, then present your plan with ExitPlanMode.`,
     };
   }
   if (mode === "yolo") return { action: "allow" };
@@ -272,6 +346,11 @@ export function decide(mode: Mode, tool: Tool, args: Record<string, unknown>, cw
     if (command && isDangerousCommand(command)) return { action: "ask", reason: "potentially dangerous command" };
     return { action: "allow" };
   }
-  if (command && isReadOnlyCommand(command)) return { action: "allow" };
+  if (command && isReadOnlyCommand(command, extraReadOnly)) return { action: "allow" };
   return { action: "ask" };
+}
+
+function oneLineCmd(c: unknown): string {
+  const s = String(c ?? "").replace(/\s+/g, " ").trim();
+  return s.length > 80 ? s.slice(0, 77) + "…" : s;
 }

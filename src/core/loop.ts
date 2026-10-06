@@ -17,7 +17,7 @@ import { buildRepoMap } from "./repomap.ts";
 import { QUESTION_REMINDER, READONLY_DENIED, READONLY_REMINDER, classifyIntent } from "./intent.ts";
 import { type MergeResult, type Worktree, createWorktree, gitRoot, mergeBack, removeWorktree } from "./worktree.ts";
 import { COMPACT_REQUEST, PLAN_MODE_OFF, PLAN_MODE_ON, buildSystemPrompt, reminder } from "./context.ts";
-import { MODES, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
+import { MODES, READONLY_HINT, decide, isReadOnlyCommand, type Mode } from "./modes.ts";
 import { failureReport, runChecks } from "./verify.ts";
 import { SessionJournal, readSession, sanitizeHistory } from "./sessions.ts";
 import type { Settings } from "./settings.ts";
@@ -732,7 +732,8 @@ export class Agent {
       ui.onToolEnd(name, permission, true);
       return permission;
     }
-    const changing = tool.kind === "edit" || (tool.kind === "exec" && !(name === "Bash" && isReadOnlyCommand(String(args.command ?? ""))));
+    const changing =
+      tool.kind === "edit" || (tool.kind === "exec" && !(name === "Bash" && isReadOnlyCommand(String(args.command ?? ""), this.settings.readOnlyCommands)));
     if (changing && tool.kind === "exec") (this.parent ?? this).execRan = true;
     if (changing) await this.checkpoint(`${name}(${this.board.toolSummary(name, args)})`, ui);
     const pre = await this.hook(ui, "PreToolUse", { tool_name: name, tool_input: args }, name, signal);
@@ -798,10 +799,15 @@ export class Agent {
   private async permit(tool: Tool, args: Record<string, unknown>, ui: AgentUI): Promise<true | string> {
     const root = this.parent ?? this;
     const readOnly = this.subagent?.readOnly || root.turnReadOnly;
-    const decision = decide(readOnly ? "plan" : root.mode, tool, args, this.cwd);
+    const decision = decide(readOnly ? "plan" : root.mode, tool, args, this.cwd, this.settings.readOnlyCommands);
     if (decision.action === "allow") return true;
     if (decision.action === "deny") {
-      if (this.subagent?.readOnly) return `${tool.name} is not allowed: this subagent is read-only.`;
+      if (this.subagent?.readOnly) {
+        const cmd = String(args.command ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+        return tool.name === "Bash"
+          ? `Not run: \`${cmd}\` may change something, and this subagent may only read. ${READONLY_HINT}`
+          : `Not run: ${tool.name} changes files, and this subagent may only read. Report what should change instead.`;
+      }
       return root.turnReadOnly ? READONLY_DENIED(tool.name) : decision.reason;
     }
     const risky = decision.reason !== undefined;

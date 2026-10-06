@@ -1,5 +1,5 @@
 import { relative } from "node:path";
-import { runProcess } from "../util.ts";
+import { runProcess, stripJsonc } from "../util.ts";
 import { type Diagnostic, LspManager, type ServerSpec } from "./lsp.ts";
 
 export interface DiagnosticsConfig {
@@ -16,28 +16,6 @@ const MAX_SHOWN = 10;
 /** JSON files that allow comments and trailing commas (tsconfig, VS Code settings, …). */
 const JSONC = /(^|\/)(tsconfig[^/]*|jsconfig[^/]*|devcontainer|\.eslintrc|\.babelrc|turbo|biome|deno|launch|settings|tasks|extensions)\.json$|\.jsonc$|\.json5$/i;
 
-/** Removes // and /* *\/ comments outside strings, and trailing commas, so JSON.parse can check the rest. */
-export function stripJsonc(text: string): string {
-  let out = "";
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '"') {
-      let j = i + 1;
-      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
-      out += text.slice(i, j + 1);
-      i = j;
-    } else if (ch === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-    } else if (ch === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2);
-      const comment = text.slice(i, end < 0 ? text.length : end + 2);
-      out += comment.replace(/[^\n]/g, " "); // keep line numbers
-      i = end < 0 ? text.length : end + 1;
-    } else out += ch;
-  }
-  return out.replace(/,(\s*[}\]])/g, " $1");
-}
 
 /** Syntax checks that need no language server: fast, and catch the broken edits local models make. */
 async function quickCheck(file: string, text: string, cwd: string): Promise<{ tool: string; diags: Diagnostic[] } | undefined> {

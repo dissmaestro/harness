@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { HooksConfig } from "../hooks/hooks.ts";
+import { stripJsonc } from "../util.ts";
 import { parseMode, type Mode } from "./modes.ts";
 import type { DiagnosticsConfig } from "./diagnostics.ts";
 import type { RoleConfig, Sampling, ThinkingConfig } from "./profile.ts";
@@ -54,6 +55,8 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** command prefixes that only read and may run without asking, also in read-only subagents (e.g. "docker compose ps") */
+  readOnlyCommands?: string[];
   /** model steps per message before the agent stops (or asks to continue, interactively); default 60 */
   maxSteps?: number;
   /** the same for each subagent; default 30 */
@@ -96,7 +99,8 @@ const DEFAULTS: Settings = {
 function readJson(path: string): Partial<Settings> {
   if (!existsSync(path)) return {};
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    // comments and trailing commas are fine (JSONC), so a settings file can explain itself
+    return JSON.parse(stripJsonc(readFileSync(path, "utf8")));
   } catch (e) {
     throw new Error(`Invalid JSON in ${path}: ${(e as Error).message}`);
   }

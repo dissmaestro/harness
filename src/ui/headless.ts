@@ -58,7 +58,7 @@ export async function runHeadless(agent: Agent, prompt: string, warnings: string
           emit({ type: "tool_end", agent: id, name, ok: !isError, summary });
           return;
         }
-        let line = isError ? c.red(resultSummary(result)) : c.dim(resultSummary(result));
+        let line = isError && !result.startsWith("Not run:") ? c.red(resultSummary(result)) : c.dim(resultSummary(result));
         if (!isError && change) {
           const { added, removed } = diffStat(change.before ?? "", change.after ?? "");
           line += " " + c.green(`+${added}`) + " " + c.red(`-${removed}`);

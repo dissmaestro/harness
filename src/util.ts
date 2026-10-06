@@ -18,6 +18,29 @@ export function resolvePath(cwd: string, p: string): string {
 }
 
 /** Keeps head and tail of long output; the middle is usually the least useful part. */
+/** Removes // and /* *\/ comments outside strings, and trailing commas, so JSON.parse can check the rest. */
+export function stripJsonc(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const comment = text.slice(i, end < 0 ? text.length : end + 2);
+      out += comment.replace(/[^\n]/g, " "); // keep line numbers
+      i = end < 0 ? text.length : end + 1;
+    } else out += ch;
+  }
+  return out.replace(/,(\s*[}\]])/g, " $1");
+}
+
 /** Saves long output (a command's, a subagent's report) so the model can page through it instead of losing the middle. */
 export function saveFullOutput(out: string, ext = "log"): string | undefined {
   try {
