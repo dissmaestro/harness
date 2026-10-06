@@ -78,6 +78,8 @@ export function layout(text: string, promptWidth: number, cols: number, cursor: 
 
 export interface EditorOptions {
   output: { write(s: string): unknown; columns?: number };
+  /** paints the rules above and below the input (e.g. gray) */
+  paintRule?: (s: string) => string;
   /** newest first, like readline */
   history?: string[];
   historySize?: number;
@@ -100,10 +102,14 @@ export class LineEditor extends EventEmitter {
   private cursorCol = 0;
   private endRow = 0;
   private closed = false;
+  /** rules above and below the input, so the line being typed (and sent messages in the scrollback) stand out */
+  frame = false;
+  private paintRule: (s: string) => string;
 
   constructor(opts: EditorOptions) {
     super();
     this.out = opts.output;
+    this.paintRule = opts.paintRule ?? ((s) => s);
     this.history = opts.history ?? [];
     this.historySize = opts.historySize ?? 1000;
   }
@@ -387,24 +393,32 @@ export class LineEditor extends EventEmitter {
     if (this.closed) return;
     const cols = this.out.columns || 80;
     const promptWidth = strWidth(stripAnsi(this.promptText));
+    const rule = this.frame ? this.paintRule("─".repeat(Math.max(10, cols - 1))) : "";
     let s = this.drawn ? (this.cursorRow ? `\x1b[${this.cursorRow}A` : "") + "\r" : "";
-    s += "\x1b[J" + this.promptText;
+    s += "\x1b[J" + (rule ? rule + "\r\n" : "") + this.promptText;
     s += this.line.replace(/\t/g, TAB).split("\n").join("\r\n" + CONT);
     // layout() counts a tab as TAB.length wide, so the original text gives the same positions
     const pos = layout(this.line, promptWidth, cols, this.cursor);
-    let { endRow, endCol } = pos;
-    if (endCol >= cols) {
+    let { endRow } = pos;
+    if (pos.endCol >= cols) {
       // the last row is exactly full: step onto the next one so the cursor arithmetic holds
       s += "\r\n";
       endRow++;
-      endCol = 0;
     }
-    const up = endRow - pos.cursorRow;
+    // rows below the first one drawn (the top rule, when there is one)
+    const top = rule ? 1 : 0;
+    let last = endRow + top;
+    if (rule) {
+      s += "\r\n" + rule;
+      last++;
+    }
+    const cursorRow = pos.cursorRow + top;
+    const up = last - cursorRow;
     s += (up > 0 ? `\x1b[${up}A` : "") + "\r" + (pos.cursorCol ? `\x1b[${pos.cursorCol}C` : "");
     this.out.write(s);
-    this.cursorRow = pos.cursorRow;
+    this.cursorRow = cursorRow;
     this.cursorCol = pos.cursorCol;
-    this.endRow = endRow;
+    this.endRow = last;
     this.drawn = true;
   }
 }

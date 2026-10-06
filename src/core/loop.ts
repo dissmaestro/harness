@@ -50,6 +50,11 @@ export interface AgentUI {
   confirm(tool: Tool, args: Record<string, unknown>, reason?: string): Promise<Approval>;
   /** interactive plan approval; without it plans are returned to the caller as text */
   approvePlan?(plan: string): Promise<PlanDecision>;
+  /**
+   * The step limit is reached: may the agent go on for another `more` steps? Without it (headless, subagents)
+   * the agent writes its final report.
+   */
+  askContinue?(used: number, more: number): Promise<boolean>;
   /** UI for a subagent's activity (e.g. indented); `id` is its number on the activity board */
   child?(label: string, id?: number): AgentUI;
 }
@@ -155,7 +160,7 @@ export class Agent {
     this.registry = opts.registry;
     this.home = opts.home;
     this.subagent = opts.subagent;
-    this.maxSteps = opts.maxSteps ?? (opts.subagent ? 30 : 60);
+    this.maxSteps = opts.maxSteps ?? (opts.subagent ? (opts.settings.subagentMaxSteps ?? 30) : (opts.settings.maxSteps ?? 60));
     this.mode = opts.mode ?? opts.settings.permissionMode;
     this.persist = !!opts.persist && !opts.subagent;
     this.changes = opts.changes ?? new ChangeTracker();
@@ -539,15 +544,22 @@ export class Agent {
     let answer = "";
     const repeats = new Map<string, number>();
 
+    let limit = this.maxSteps;
+    // interactively the user is asked once all steps are used; otherwise the last step is kept for the report
+    const canAsk = !this.subagent && !!ui.askContinue;
     for (let step = 0; ; step++) {
-      if (step >= this.maxSteps - 1 && !finalStep) {
-        // Out of steps: one last request without tools so the caller still gets a report.
-        finalStep = `You have used all ${this.maxSteps} steps for this task.`;
-        this.push({ role: "user", content: reminder(FINAL_STEP(finalStep)) });
+      if (!finalStep && step >= (canAsk ? limit : limit - 1)) {
+        if (canAsk && !signal.aborted && (await ui.askContinue!(step, this.maxSteps))) {
+          limit += this.maxSteps;
+        } else {
+          // one last request without tools so the caller still gets a report
+          finalStep = `You have used all ${canAsk ? step : limit} steps for this task.`;
+          this.push({ role: "user", content: reminder(FINAL_STEP(finalStep)) });
+        }
       }
       if (await this.shouldCompact()) await this.compact(ui, signal, { midTurn: true });
 
-      this.activity.update({ step: step + 1, maxSteps: this.maxSteps });
+      this.activity.update({ step: step + 1, maxSteps: limit });
       const res = await this.request(ui, signal);
       if (res.usage) {
         this.lastUsage = res.usage;

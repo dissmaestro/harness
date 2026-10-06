@@ -54,6 +54,12 @@ export interface Settings {
   editor?: string;
   /** clickable file paths (OSC 8 terminal hyperlinks) */
   hyperlinks?: boolean;
+  /** model steps per message before the agent stops (or asks to continue, interactively); default 60 */
+  maxSteps?: number;
+  /** the same for each subagent; default 30 */
+  subagentMaxSteps?: number;
+  /** draw rules above and below the input line; default true */
+  promptFrame?: boolean;
   /** model family preset: auto (from the model name), qwen3.6, qwen3, none */
   profile?: string;
   /** sampling parameters sent with every request (top_k/min_p are understood by vLLM, llama.cpp, SGLang) */

@@ -126,3 +126,25 @@ test("askAside: no tools, answer from the board, history untouched", async () =>
     srv.close();
   }
 });
+
+test("step limit: interactively the user is asked after all steps; yes adds more, no gets the report", async () => {
+  const glob = () => call("Glob", { pattern: "*" });
+  const srv = await fakeServer((body) => (/used all \d+ steps/.test(JSON.stringify(body.messages.at(-1))) ? text("report") : glob()));
+  try {
+    const cwd = tempDir();
+    const home = tempDir();
+    const settings = { ...loadSettings(cwd, home), baseUrl: srv.url, maxSteps: 2, repoMap: false as const };
+    const registry = await loadRegistry(cwd, settings, noWarn, home);
+    const agent = new Agent({ cwd, settings, registry, home });
+    assert.equal(agent.maxSteps, 2, "maxSteps comes from settings");
+    const asked: number[] = [];
+    const answers = [true, false];
+    const ui = { ...silentUI([]), askContinue: async (used: number) => (asked.push(used), answers.shift()!) };
+    const answer = await agent.send("go", ui, new AbortController().signal);
+    assert.deepEqual(asked, [2, 4]);
+    assert.equal(answer, "report");
+    assert.equal(srv.requests.length, 5, "4 steps + the report");
+  } finally {
+    srv.close();
+  }
+});

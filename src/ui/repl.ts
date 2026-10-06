@@ -181,7 +181,9 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   // While agents work, readline's own echo is muted and the footer draws the typed line instead.
   let muted = () => false;
   // In a terminal our own multi-line editor; readline only for piped input.
-  const editor = tty ? new LineEditor({ output: new MutableOutput(out, () => muted()), history: [...history].reverse(), historySize: 1000 }) : undefined;
+  const editor = tty
+    ? new LineEditor({ output: new MutableOutput(out, () => muted()), history: [...history].reverse(), historySize: 1000, paintRule: c.gray })
+    : undefined;
   const rl =
     editor ??
     createInterface({
@@ -219,7 +221,10 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       if (!running || waiter) return [];
       const ctx = ctxWindow ? ` · ${contextLabel(agent.contextUsed(), ctxWindow)}` : "";
       const what = activitySummary(agent.board) || "thinking";
-      return [`${c.magenta(frame)} ${c.dim(`${what} · ${formatDuration(Date.now() - runStarted)}${ctx} · ctrl+c to interrupt`)}`, inputRow()];
+      const status = `${c.magenta(frame)} ${c.dim(`${what} · ${formatDuration(Date.now() - runStarted)}${ctx} · ctrl+c to interrupt`)}`;
+      if (agent.settings.promptFrame === false) return [status, inputRow()];
+      const rule = c.gray("─".repeat(Math.max(10, (out.columns || 80) - 1)));
+      return [status, rule, inputRow(), rule];
     },
     () => outCol,
   );
@@ -306,6 +311,8 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
   const nextLine = (prompt: string, fresh = false): Promise<string | null> => {
     footer.clear();
     rl.setPrompt(prompt);
+    // the main prompt sits between two rules (easy to find in the scrollback); answers to questions don't
+    if (editor) editor.frame = !fresh && agent.settings.promptFrame !== false;
     atLineStart = true;
     waiterFresh = fresh;
     if (!fresh && queue.length) {
@@ -530,6 +537,15 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
     return confirmAnswer(a, !!reason);
   };
 
+  /** the step limit is reached: Enter or y goes on for another `more` steps, n lets the agent wrap up */
+  const askContinue = async (used: number, more: number): Promise<boolean> => {
+    endText();
+    line(c.yellow(`  ⏸ The agent has used ${used} steps on this message.`) + c.dim(' ("maxSteps" in settings.json sets the limit)'));
+    const a = await answer(c.yellow(`  Continue for ${more} more steps? [Y]es · [n]o, wrap up › `));
+    if (a === null || running?.signal.aborted) return false;
+    return !/^\s*[nн]/i.test(a);
+  };
+
   const approvePlan = async (plan: string): Promise<PlanDecision> => {
     endText();
     line(mdBox(plan, "Plan", c.cyan));
@@ -578,6 +594,7 @@ export async function runRepl(agent: Agent, warnings: string[], initialPrompt?: 
       onInfo: (m) => line(pad + c.yellow(`  ${m}`)),
       confirm: (tool, args, reason) => confirm(pad, tool, args, reason),
       approvePlan: depth ? undefined : approvePlan,
+      askContinue: depth ? undefined : askContinue,
       child: (label, childId) => {
         line(pad + c.magenta("  ◆ ") + c.bold(`subagent${childId ? ` #${childId}` : ""} `) + c.dim(label));
         return makeUI(depth + 1, childId);

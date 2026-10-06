@@ -28,7 +28,8 @@ const USAGE = `Usage: agent [options] [prompt]
       --auto             same as --mode auto (everything except dangerous actions)
       --accept-edits     same as --mode acceptEdits
       --yolo             same as --mode yolo (never ask)
-      --max-steps <n>    stop after n model turns per prompt (default 60)
+      --max-steps <n>    model steps per message before asking to continue
+                         (default: "maxSteps" in settings.json, else 60)
       --test-cmd <cmd>   run after a turn that changed files; failures go back to the model
       --lint-cmd <cmd>   same, run before the tests
   -c, --continue         continue the latest conversation in this directory
